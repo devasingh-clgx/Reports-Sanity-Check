@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Power BI Headless Sanity Host</title>
+    <style>
+        html, body { margin: 0; padding: 0; }
+        /* Headless Chromium (driven by the pipeline API) renders each report here. It is positioned
+           off-screen but kept on-screen-sized so Power BI lays out and draws every visual exactly
+           as it would for a real viewer. */
+        #pbi-headless-host {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 1280px;
+            height: 720px;
+        }
+    </style>
+    <!-- Self-hosted Power BI client UMD bundle (same one App.razor loads). Exposes window.powerbi
+         (the service) and window['powerbi-client'] (the library with models). No CDN, so this works
+         in locked-down/AVD networks and inside the container image. -->
+    <script src="lib/powerbi/powerbi.min.js"></script>
+    <script type="module">
+        import {
+            checkReport,
+            beginInteractions,
+            drainInteractionErrors,
+            endInteractions,
+            getActivePageNameForInteraction,
+            getActivePageInfoForInteraction,
+            getVisiblePagesForInteraction,
+            setActivePageForInteraction,
+            getApplyableBookmarksForInteraction,
+            applyBookmarkForInteraction,
+            getDataVisualsForInteraction,
+            findDrillThroughSourceVisuals,
+            probeVisualCapabilities,
+            getFirstDataRowForVisual,
+            openDrillThroughPageForInteraction
+        } from './js/powerbi-sanity.js';
+
+        window.__sanityCheckReport = checkReport;
+        window.__sanityBeginInteractions = beginInteractions;
+        window.__sanityDrainInteractionErrors = drainInteractionErrors;
+        window.__sanityEndInteractions = endInteractions;
+        window.__sanityActivePage = getActivePageNameForInteraction;
+        window.__sanityActivePageInfo = getActivePageInfoForInteraction;
+        window.__sanityVisiblePages = getVisiblePagesForInteraction;
+        window.__sanitySetActivePage = setActivePageForInteraction;
+        window.__sanityApplyableBookmarks = getApplyableBookmarksForInteraction;
+        window.__sanityApplyBookmark = applyBookmarkForInteraction;
+        window.__sanityDataVisuals = getDataVisualsForInteraction;
+        window.__sanityFindDrillThroughSources = findDrillThroughSourceVisuals;
+        window.__sanityProbeVisualCapabilities = probeVisualCapabilities;
+        window.__sanityFirstDataRow = getFirstDataRowForVisual;
+        window.__sanityOpenDrillThroughPage = openDrillThroughPageForInteraction;
+        window.__sanityReady = true;
+    </script>
+</head>
+
+<body>
+    <div id="pbi-headless-host"></div>
+</body>
+
+</html>

@@ -1,0 +1,37 @@
+# Build artifacts (root-anchored + nested, so stale publish output never enters the context)
+bin/
+obj/
+out/
+**/bin/
+**/obj/
+**/out/
+
+# Visual Studio "Publish" leftovers that bloat the context (node.exe, publish .zip archives)
+**/PubTmp/
+**/.playwright/
+**/publish/
+*.tar
+*.tar.gz
+*.zip
+
+# Local tooling / IDE
+.vs/
+.vs/**
+**/.vs/
+**/.vs/**
+**/*.vsidx
+.vscode/
+**/*.user
+
+# Git
+.git/
+.gitignore
+
+# Container files
+Dockerfile
+.dockerignore
+
+# Local secrets / run outputs (never ship these into the image)
+**/appsettings.Development.json
+**/*.Development.json
+App_Data/

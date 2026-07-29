@@ -1,0 +1,27 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Reports_Sanity_Check</RootNamespace>
+    <AssemblyName>$(AssemblyName.Replace(' ', '_'))</AssemblyName>
+    <DockerDefaultTargetOS>Linux</DockerDefaultTargetOS>
+    <DockerfileFile>Dockerfile</DockerfileFile>
+    <DockerfileContext>.</DockerfileContext>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Identity.Client" Version="4.84.2" />
+    <PackageReference Include="Microsoft.PowerBI.JavaScript" Version="2.23.9" GeneratePathProperty="true" />
+    <PackageReference Include="Microsoft.Playwright" Version="1.61.0" />
+    <PackageReference Include="SendGrid" Version="9.29.3" />
+    <PackageReference Include="Microsoft.VisualStudio.Azure.Containers.Tools.Targets" Version="1.23.0" />
+  </ItemGroup>
+
+  <Target Name="CopyPowerBiClient" BeforeTargets="BeforeBuild" Inputs="$(PkgMicrosoft_PowerBI_JavaScript)\content\scripts\powerbi.min.js" Outputs="$(MSBuildProjectDirectory)\wwwroot\lib\powerbi\powerbi.min.js">
+    <MakeDir Directories="$(MSBuildProjectDirectory)\wwwroot\lib\powerbi" />
+    <Copy SourceFiles="$(PkgMicrosoft_PowerBI_JavaScript)\content\scripts\powerbi.min.js" DestinationFolder="$(MSBuildProjectDirectory)\wwwroot\lib\powerbi" SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>
