@@ -1,4 +1,4 @@
-using Reports_Sanity_Check.Services.Notifications;
+using System.Diagnostics;
 using Reports_Sanity_Check.Services.PowerBi;
 using Reports_Sanity_Check.Services.PowerBi.Models;
 
@@ -16,9 +16,8 @@ namespace Reports_Sanity_Check.Services.Api;
 ///   have rendered with errors/timeouts; those are recorded in the run summary and are NOT job
 ///   failures.</description></item>
 ///   <item><description><c>1</c> — the workflow itself failed (bad input, no workspace resolved,
-///   report discovery/auth error, headless browser failure, or a persistence failure). Because Log
-///   Analytics is disabled for the Job, these failures also raise an email alert to the configured
-///   <c>SendGrid:AdminEmails</c> so they can be tracked.</description></item>
+///   report discovery/auth error, headless browser failure, or a persistence failure). These failures
+///   are written to the Container Apps console logs.</description></item>
 /// </list>
 ///
 /// The job is always triggered from the Fabric workspace, which passes parameters as env vars:
@@ -34,23 +33,8 @@ public static class SanityJobRunner
     {
         var logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("SanityJobRunner");
 
-        // Hold the scope for the whole run so the (scoped) email notifier is still usable from the
-        // catch block to raise an operational alert if the workflow throws.
         using var scope = app.Services.CreateScope();
-        var emailNotifier = scope.ServiceProvider.GetRequiredService<IEmailNotificationService>();
 
-        // Because Log Analytics is disabled for the Job, the admin email is the ONLY failure signal.
-        // Log up front (at Error) when it can't be delivered so a silent "no email" run is diagnosable
-        // from container stdout instead of looking like nothing ran.
-        var emailOptions = scope.ServiceProvider.GetRequiredService<Microsoft.Extensions.Options.IOptions<EmailOptions>>().Value;
-        if (!emailOptions.CanSendAdminAlerts)
-        {
-            logger.LogError(
-                "Admin failure alerts are NOT deliverable: {Reason}. Workflow failures will be logged here but no email will be sent.",
-                emailOptions.DescribeAdminAlertGap());
-        }
-
-        // Keep the raw inputs so any failure alert can show them with hidden whitespace made visible.
         string? rawWorkspaceId = null;
         string? rawRecipients = null;
         string? rawIdentityUsername = null;
@@ -58,6 +42,20 @@ public static class SanityJobRunner
         string? rawMaxReports = null;
         var stage = "Startup";
         var hostStarted = false;
+        SanityCheckRun? run = null;
+
+        void RecordStage(string name, Stopwatch stopwatch, int count = 0)
+        {
+            stopwatch.Stop();
+            run?.PerformancePhases.Add(new PerformancePhase
+            {
+                Name = name,
+                DurationMs = stopwatch.ElapsedMilliseconds,
+                Count = count
+            });
+            logger.LogInformation("Performance phase {Phase}: {DurationMs} ms (count {Count}).",
+                name, stopwatch.ElapsedMilliseconds, count);
+        }
 
         try
         {
@@ -87,7 +85,6 @@ public static class SanityJobRunner
             {
                 const string error = "No workspace resolved. The Fabric trigger must pass WorkspaceId (or set PowerBi:WorkspaceId for local dev).";
                 logger.LogError("Job: {Error}", error);
-                await emailNotifier.SendJobFailureAsync(stage, error, BuildInputContext(rawWorkspaceId, rawRecipients, rawIdentityUsername, rawIdentityRoles, rawMaxReports));
                 return 1;
             }
 
@@ -100,7 +97,6 @@ public static class SanityJobRunner
                     $"Resolved WorkspaceId is not a valid GUID: '{workspaceId}'. Check the pipeline input " +
                     "for hidden characters such as a trailing newline (\\n), carriage return (\\r), or tab (\\t).";
                 logger.LogError("Job: {Error}", error);
-                await emailNotifier.SendJobFailureAsync(stage, error, BuildInputContext(rawWorkspaceId, rawRecipients, rawIdentityUsername, rawIdentityRoles, rawMaxReports));
                 return 1;
             }
 
@@ -118,21 +114,25 @@ public static class SanityJobRunner
             // Preflight: verify the service principal can authenticate AND actually reach this workspace
             // in one cheap REST call, BEFORE starting the host or the long render loop. This turns what
             // was a silent failed run into a fast, actionable alert and also resolves the friendly name.
+            run = new SanityCheckRun { WorkspaceId = workspaceId };
             stage = "Workspace access check";
+            var stageStopwatch = Stopwatch.StartNew();
             var access = await embed.VerifyWorkspaceAccessAsync(workspaceId);
+            RecordStage(stage, stageStopwatch);
             if (!access.HasAccess)
             {
                 logger.LogError("Job: workspace access check failed: {Error}", access.Error);
-                await emailNotifier.SendJobFailureAsync(stage, access.Error ?? "Workspace access check failed.", BuildInputContext(rawWorkspaceId, rawRecipients, rawIdentityUsername, rawIdentityRoles, rawMaxReports));
                 return 1;
             }
 
             var workspaceName = FirstNonBlank(access.WorkspaceName) ?? workspaceId;
-            var run = new SanityCheckRun { WorkspaceId = workspaceId, WorkspaceName = workspaceName };
+            run.WorkspaceName = workspaceName;
 
             stage = "Report discovery";
             logger.LogInformation("Job sanity run starting for workspace {WorkspaceId} ({Name}).", workspaceId, workspaceName);
+            stageStopwatch = Stopwatch.StartNew();
             var embeds = await sanity.PrepareRunAsync(workspaceId);
+            RecordStage(stage, stageStopwatch, embeds.Count);
 
             if (embeds.Count == 0)
             {
@@ -147,12 +147,8 @@ public static class SanityJobRunner
                 RenderTimeoutMs = sanity.RenderTimeoutSeconds * 1000,
                 BookmarkApplyTimeoutMs = sanity.BookmarkApplyTimeoutSeconds * 1000,
                 OverallTimeoutMs = sanity.OverallTimeoutSeconds * 1000,
-                CheckBookmarks = sanity.CheckBookmarks,
-                CheckAllPages = sanity.CheckAllPages,
                 PageTimeoutMs = sanity.PageTimeoutSeconds * 1000,
                 MaxPagesPerReport = sanity.GetMaxPagesPerReport(),
-                CheckDrillThrough = sanity.CheckDrillThrough,
-                CheckToggles = sanity.CheckToggles,
                 InteractionSettleMs = sanity.InteractionSettleSeconds * 1000,
                 MaxInteractionsPerReport = sanity.GetMaxInteractionsPerReport(),
                 MaxDrillThroughDepth = sanity.GetMaxDrillThroughDepth(),
@@ -168,21 +164,26 @@ public static class SanityJobRunner
                 : new Uri("http://localhost:8080/", UriKind.Absolute);
 
             // Start Kestrel now (not at the top) so the headless browser can reach headless-check.html
-            // on localhost. Kept INSIDE the try so a bind/startup failure raises the admin alert instead
-            // of crashing before the catch block — the original silent-failure cause.
+            // on localhost. Kept inside the try so a bind/startup failure is captured in console logs.
             stage = "Host startup";
+            stageStopwatch = Stopwatch.StartNew();
             await app.StartAsync();
             hostStarted = true;
+            RecordStage(stage, stageStopwatch);
 
             stage = "Headless render";
+            stageStopwatch = Stopwatch.StartNew();
             var interop = await headless.CheckReportsAsync(hostBaseUri, embeds, options);
+            RecordStage(stage, stageStopwatch, embeds.Count);
             for (var i = 0; i < embeds.Count; i++)
             {
                 run.Results.Add(sanity.BuildResult(embeds[i], interop[i]));
             }
 
             stage = "Persist and notify";
+            stageStopwatch = Stopwatch.StartNew();
             await sanity.SaveRunAsync(run, recipients);
+            RecordStage(stage, stageStopwatch);
             logger.LogInformation("Job sanity run {RunId} finished: {Passed}/{Total} passed.", run.RunId, run.PassedCount, run.TotalReports);
 
             // A report rendering with errors/timeouts is NOT a job failure — it is recorded in the run
@@ -192,15 +193,14 @@ public static class SanityJobRunner
         catch (Exception ex)
         {
             // Any exception that reaches here is a workflow/infrastructure failure (not a single report
-            // breaking, which HeadlessReportChecker already contains). Alert admins with full detail.
+            // breaking, which HeadlessReportChecker already contains). Container Apps captures this log.
             logger.LogError(ex, "Job workflow failed at stage '{Stage}'.", stage);
-            await emailNotifier.SendJobFailureAsync(stage, ex.ToString(), BuildInputContext(rawWorkspaceId, rawRecipients, rawIdentityUsername, rawIdentityRoles, rawMaxReports));
             return 1;
         }
         finally
         {
             // Only stop the host if it was actually started; a preflight failure returns before startup.
-            // Shutdown must never change the job's outcome: the summary/failure email has already been sent
+            // Shutdown must never change the job's outcome: the summary has already been persisted and sent
             // by this point, so a slow or throwing Kestrel/Playwright teardown must NOT flip a successful
             // run's exit code to non-zero (which the Container App Job would report as "failed"). Guard the
             // stop with a bounded timeout and swallow any error so the computed return code stands.
@@ -313,22 +313,4 @@ public static class SanityJobRunner
     private static string? FirstNonBlank(params string?[] values) =>
         values.FirstOrDefault(static v => !string.IsNullOrWhiteSpace(v))?.Trim();
 
-    /// <summary>
-    /// Builds the raw-input diagnostic map for a failure alert. The values are shown with hidden
-    /// whitespace made visible by the email service so characters like <c>\n</c> are obvious.
-    /// </summary>
-    private static IReadOnlyDictionary<string, string?> BuildInputContext(
-        string? workspaceId,
-        string? recipients,
-        string? identityUsername,
-        string? identityRoles,
-        string? maxReports = null) =>
-        new Dictionary<string, string?>
-        {
-            ["WorkspaceId (raw)"] = workspaceId,
-            ["ToEmails (raw)"] = recipients,
-            ["EffectiveIdentityUsername (raw)"] = identityUsername,
-            ["EffectiveIdentityRoles (raw)"] = identityRoles,
-            ["MaxReportsToCheck (raw)"] = maxReports
-        };
 }

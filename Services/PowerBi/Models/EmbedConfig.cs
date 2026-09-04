@@ -33,6 +33,10 @@ public sealed class EmbedConfig
     /// </summary>
     public string? DrillThroughMapDiagnostic { get; set; }
 
+    public string? LandingPageName { get; set; }
+
+    public string? LandingPageDisplayName { get; set; }
+
     /// <summary>
     /// Every visual declared in the report definition and the field(s) it projects. Read statically
     /// from metadata, so drill-through SOURCE visuals can be identified by field overlap even when the

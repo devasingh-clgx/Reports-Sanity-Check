@@ -54,6 +54,12 @@ public sealed class BookmarkCheckResult
 
     public SanityStatus Status { get; set; } = SanityStatus.Pending;
 
+    /// <summary>
+    /// True when the bookmark is a parameter-dependent drill-through placeholder that must be reached
+    /// through the native interaction path rather than applied without drill-through context.
+    /// </summary>
+    public bool Skipped { get; set; }
+
     public int ErrorCount { get; set; }
 
     /// <summary>How long this bookmark took to apply and re-render, in milliseconds.</summary>
@@ -197,6 +203,60 @@ public sealed class DrillThroughDiagnostics
     public List<DrillThroughSourceVisual> SourceVisuals { get; set; } = new();
 }
 
+/// <summary>A named wall-clock measurement captured during a sanity-check run.</summary>
+public sealed class PerformancePhase
+{
+    public string Name { get; set; } = string.Empty;
+
+    public long DurationMs { get; set; }
+
+    /// <summary>Number of operations represented by this measurement, when applicable.</summary>
+    public int Count { get; set; }
+
+    /// <summary>Optional page, bookmark, recursion depth, or other measurement scope.</summary>
+    public string? Scope { get; set; }
+}
+
+/// <summary>A point-in-time Chromium resource sample captured through the DevTools protocol.</summary>
+public sealed class BrowserResourceSample
+{
+    public string Phase { get; set; } = string.Empty;
+
+    public long ElapsedMs { get; set; }
+
+    public long BrowserWorkingSetBytes { get; set; }
+
+    public long BrowserPrivateMemoryBytes { get; set; }
+
+    public long JavaScriptHeapUsedBytes { get; set; }
+
+    public long JavaScriptHeapTotalBytes { get; set; }
+
+    public int BrowserProcessCount { get; set; }
+}
+
+/// <summary>Detailed timing and resource behavior for one report's browser lifetime.</summary>
+public sealed class PerformanceDiagnostics
+{
+    public long ContextAgeAtStartMs { get; set; }
+
+    public long ContextAgeAtEndMs { get; set; }
+
+    public long PageLifetimeMs { get; set; }
+
+    public List<PerformancePhase> Phases { get; set; } = new();
+
+    public List<BrowserResourceSample> ResourceSamples { get; set; } = new();
+
+    [JsonIgnore]
+    public long PeakBrowserWorkingSetBytes =>
+        ResourceSamples.Count == 0 ? 0 : ResourceSamples.Max(sample => sample.BrowserWorkingSetBytes);
+
+    [JsonIgnore]
+    public long PeakJavaScriptHeapUsedBytes =>
+        ResourceSamples.Count == 0 ? 0 : ResourceSamples.Max(sample => sample.JavaScriptHeapUsedBytes);
+}
+
 /// <summary>
 /// A visual identified as a drill-through SOURCE because it projects the field(s) a declared
 /// destination page is filtered by, plus the first data row exported from it.
@@ -316,6 +376,25 @@ public sealed class DrillThroughProbe
     /// <summary>The field the right-clicked cell is bound to, when the element exposes one.</summary>
     public string? FieldRef { get; set; }
 
+    /// <summary>Text and data attributes read from the exact DOM element that received the right-click.</summary>
+    public List<DrillThroughCell> ClickedData { get; set; } = new();
+
+    /// <summary>The exported source-visual row associated with the clicked element, when available.</summary>
+    public List<DrillThroughCell> SourceRow { get; set; } = new();
+
+    /// <summary>Compact data context included in interaction failure messages.</summary>
+    [JsonIgnore]
+    public string ClickedDataSummary
+    {
+        get
+        {
+            var cells = ClickedData.Count > 0 ? ClickedData : SourceRow;
+            return cells.Count == 0
+                ? string.Empty
+                : string.Join(", ", cells.Take(6).Select(cell => $"{cell.Column}={cell.Value}"));
+        }
+    }
+
     /// <summary>Every menu item label that appeared after the right-click.</summary>
     public List<string> MenuItems { get; set; } = new();
 
@@ -374,10 +453,7 @@ public enum DrillThroughVerificationMethod
     None = 0,
 
     /// <summary>Real user gesture: right-click a source data point -> "Drill through" -> target page.</summary>
-    RealGesture = 1,
-
-    /// <summary>Metadata fallback: SDK opened the destination page with the bound field filter context.</summary>
-    MetadataFallback = 2
+    RealGesture = 1
 }
 
 /// <summary>A field a drill-through target is bound to, identified by its table and column names.</summary>
@@ -415,6 +491,9 @@ public sealed class ReportCheckInteropResult
 
     /// <summary>Scan-level drill-through coverage counters, so missed drill-throughs are visible.</summary>
     public DrillThroughDiagnostics DrillThrough { get; set; } = new();
+
+    /// <summary>Detailed phase timings and browser resource samples for performance analysis.</summary>
+    public PerformanceDiagnostics Performance { get; set; } = new();
 }
 
 /// <summary>The full, persisted result for one report.</summary>
@@ -449,6 +528,9 @@ public sealed class ReportSanityResult
 
     /// <summary>Scan-level drill-through coverage counters, so missed drill-throughs are visible.</summary>
     public DrillThroughDiagnostics DrillThrough { get; set; } = new();
+
+    /// <summary>Detailed phase timings and browser resource samples for performance analysis.</summary>
+    public PerformanceDiagnostics Performance { get; set; } = new();
 
     public bool IsHealthy => Status == SanityStatus.Passed;
 
@@ -487,6 +569,9 @@ public sealed class SanityCheckRun
     public string? WorkspaceName { get; set; }
 
     public DateTimeOffset StartedAtUtc { get; set; } = DateTimeOffset.UtcNow;
+
+    /// <summary>End-to-end workflow stage timings, including discovery and persistence.</summary>
+    public List<PerformancePhase> PerformancePhases { get; set; } = new();
 
     public DateTimeOffset? CompletedAtUtc { get; set; }
 

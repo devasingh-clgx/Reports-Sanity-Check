@@ -50,6 +50,9 @@ public interface IPowerBiEmbedService
     /// </summary>
     Task<IReadOnlyList<DrillThroughTarget>> GetDrillThroughMapAsync(PowerBiReportConfig report, CancellationToken cancellationToken = default);
 
+    /// <summary>Reads report page identity and ordering from the Power BI REST API.</summary>
+    Task<IReadOnlyList<PowerBiReportPage>> GetReportPagesAsync(PowerBiReportConfig report, CancellationToken cancellationToken = default);
+
     /// <summary>
     /// Explains why the most recent <see cref="GetDrillThroughMapAsync"/> call produced no targets;
     /// null when targets were found.
@@ -64,6 +67,15 @@ public interface IPowerBiEmbedService
     /// Never throws; returns an empty list when the definition can't be read.
     /// </summary>
     Task<IReadOnlyList<ReportVisualDefinition>> GetVisualFieldMapAsync(PowerBiReportConfig report, CancellationToken cancellationToken = default);
+}
+
+public sealed class PowerBiReportPage
+{
+    public string Name { get; set; } = string.Empty;
+
+    public string DisplayName { get; set; } = string.Empty;
+
+    public int Order { get; set; }
 }
 
 /// <summary>
@@ -105,26 +117,6 @@ public sealed class PowerBiEmbedService : IPowerBiEmbedService
 
     public async Task<IReadOnlyList<PowerBiReportConfig>> GetReportsToCheckAsync(string? workspaceId = null, CancellationToken cancellationToken = default)
     {
-        if (!_options.AutoDiscoverReports)
-        {
-            // Explicit report list: when a target workspace is supplied, apply it to any report that
-            // doesn't already pin its own workspace so the run targets the chosen environment.
-            var configured = _options.Reports
-                .Where(r => !string.IsNullOrWhiteSpace(r.ReportId))
-                .Select(r => string.IsNullOrWhiteSpace(workspaceId) || !string.IsNullOrWhiteSpace(r.WorkspaceId)
-                    ? r
-                    : new PowerBiReportConfig
-                    {
-                        ReportId = r.ReportId,
-                        DisplayName = r.DisplayName,
-                        WorkspaceId = workspaceId
-                    })
-                .ToList();
-
-            _logger.LogInformation("Using {Count} explicitly configured Power BI report(s).", configured.Count);
-            return configured;
-        }
-
         var targetWorkspaceId = RequireWorkspaceId(
             !string.IsNullOrWhiteSpace(workspaceId) ? workspaceId : _options.WorkspaceId);
 
@@ -468,18 +460,23 @@ public sealed class PowerBiEmbedService : IPowerBiEmbedService
 
             var targets = ParseDrillThroughTargets(parts);
 
-            // FALLBACK: a page.json shape we don't recognise must not erase a report's real drill-through.
-            // Hidden pages that are not referenced as page-navigation destinations are drill-through
-            // destinations by construction, so recover them from pages.json visibility. Fields may be
-            // unknown, which downgrades verification but still names the destination.
-            if (targets.Count == 0)
+            // Keep hidden pages visible as diagnostic candidates even when explicit PBIR targets were found.
+            // A hidden page with no binding/fields is not actionable, but omitting it would hide possible
+            // authoring gaps such as a page intended for drill-through but not configured as one.
+            foreach (var hiddenPage in RecoverHiddenPagesAsTargets(parts))
             {
-                targets = RecoverHiddenPagesAsTargets(parts);
-                if (targets.Count > 0)
+                var existing = targets.FirstOrDefault(target =>
+                    (!string.IsNullOrWhiteSpace(hiddenPage.PageName) &&
+                     string.Equals(target.PageName, hiddenPage.PageName, StringComparison.OrdinalIgnoreCase)) ||
+                    (!string.IsNullOrWhiteSpace(hiddenPage.PageDisplayName) &&
+                     string.Equals(target.PageDisplayName, hiddenPage.PageDisplayName, StringComparison.OrdinalIgnoreCase)));
+                if (existing is null)
                 {
-                    _logger.LogInformation(
-                        "Recovered {Count} hidden page(s) as drill-through destinations for report {ReportId} " +
-                        "after filter parsing found none.", targets.Count, reportId);
+                    targets.Add(hiddenPage);
+                }
+                else if (existing.Fields.Count == 0 && hiddenPage.Fields.Count > 0)
+                {
+                    existing.Fields = hiddenPage.Fields;
                 }
             }
 
@@ -487,6 +484,8 @@ public sealed class PowerBiEmbedService : IPowerBiEmbedService
                 "Parsed {Count} drill-through target(s) for report {ReportId}: {Targets}",
                 targets.Count, reportId,
                 targets.Count == 0 ? "(none)" : string.Join("; ", targets.Select(t => $"{t.PageDisplayName} [{t.FieldSummary}]")));
+
+            var pageClassification = DescribePbirPages(parts);
 
             // GROUND TRUTH: when we find no targets, dump the real decoded page definitions so we can
             // see the actual JSON shape Fabric returns instead of guessing key names. This is emitted at
@@ -500,7 +499,7 @@ public sealed class PowerBiEmbedService : IPowerBiEmbedService
             }
             else
             {
-                LastDrillThroughMapDiagnostic = null;
+                LastDrillThroughMapDiagnostic = pageClassification;
             }
 
             return targets;
@@ -511,6 +510,33 @@ public sealed class PowerBiEmbedService : IPowerBiEmbedService
                 "Failed to read drill-through map for report {ReportId}; continuing with an empty map.", report.ReportId);
             LastDrillThroughMapDiagnostic = $"Failed to read drill-through metadata: {ex.GetType().Name}: {ex.Message}";
             return Array.Empty<DrillThroughTarget>();
+        }
+    }
+
+    public async Task<IReadOnlyList<PowerBiReportPage>> GetReportPagesAsync(
+        PowerBiReportConfig report,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(report.ReportId))
+        {
+            return Array.Empty<PowerBiReportPage>();
+        }
+
+        try
+        {
+            var workspaceId = ParseGuid(report.WorkspaceId ?? _options.WorkspaceId ?? string.Empty, "WorkspaceId");
+            var reportId = ParseGuid(report.ReportId, nameof(report.ReportId));
+            using var client = await CreateAuthorizedClientAsync(cancellationToken);
+            var response = await client.GetFromJsonAsync<PowerBiListResponse<PowerBiReportPage>>(
+                $"v1.0/myorg/groups/{workspaceId}/reports/{reportId}/pages",
+                JsonOptions,
+                cancellationToken);
+            return response?.Value ?? new List<PowerBiReportPage>();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to read page metadata for report {ReportId}.", report.ReportId);
+            return Array.Empty<PowerBiReportPage>();
         }
     }
 
@@ -865,7 +891,7 @@ public sealed class PowerBiEmbedService : IPowerBiEmbedService
                 if (isPbirPage)
                 {
                     // Enhanced-PBIR: this part IS a single page.
-                    AddTargetIfDrillThrough(root, targets);
+                    AddTargetIfDrillThrough(root, targets, requirePageBinding: true);
                 }
                 else
                 {
@@ -875,14 +901,14 @@ public sealed class PowerBiEmbedService : IPowerBiEmbedService
                     {
                         foreach (var section in sections.EnumerateArray())
                         {
-                            AddTargetIfDrillThrough(section, targets);
+                            AddTargetIfDrillThrough(section, targets, requirePageBinding: false);
                         }
                     }
                     else
                     {
                         // Some legacy definitions nest the layout under "layout"/"config"; fall back to a
                         // recursive scan of the whole document for any page-like object with drill-through.
-                        AddTargetIfDrillThrough(root, targets);
+                        AddTargetIfDrillThrough(root, targets, requirePageBinding: false);
                     }
                 }
             }
@@ -959,6 +985,41 @@ public sealed class PowerBiEmbedService : IPowerBiEmbedService
         return recovered;
     }
 
+    private static string? DescribePbirPages(IReadOnlyList<FabricDefinitionPart> parts)
+    {
+        var descriptions = new List<string>();
+        foreach (var part in parts.Where(part =>
+                     part.Path?.EndsWith("/page.json", StringComparison.OrdinalIgnoreCase) == true &&
+                     !string.IsNullOrEmpty(part.Payload)))
+        {
+            try
+            {
+                var json = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(part.Payload!));
+                using var doc = JsonDocument.Parse(json);
+                var page = doc.RootElement;
+                var name = GetStringProp(page, "displayName", "DisplayName")
+                           ?? GetStringProp(page, "name", "Name")
+                           ?? part.Path!;
+                var visibility = GetStringProp(page, "visibility", "Visibility") ?? "Visible";
+                var binding = IsDrillThroughPageBinding(page) ? "Drillthrough" : "none";
+                var markedFields = ExtractDrillThroughFields(page, pageIsDrillThroughDestination: false);
+                descriptions.Add($"{name} [visibility={visibility}, pageBinding={binding}, markedFields={markedFields.Count}]");
+            }
+            catch (FormatException)
+            {
+                // Ignore malformed definition parts in best-effort diagnostics.
+            }
+            catch (JsonException)
+            {
+                // Ignore malformed definition parts in best-effort diagnostics.
+            }
+        }
+
+        return descriptions.Count == 0
+            ? null
+            : "PBIR page classification: " + string.Join("; ", descriptions);
+    }
+
     // Diagnostic-only: decode every page/report part and log its real JSON so we can read the ACTUAL
     // drill-through structure Fabric returns rather than guessing key names. Payloads are chunked because
     // log sinks truncate long lines. Called only when we discovered zero targets, so it costs nothing on
@@ -1018,7 +1079,10 @@ public sealed class PowerBiEmbedService : IPowerBiEmbedService
         }
     }
 
-    private static void AddTargetIfDrillThrough(JsonElement pageElement, List<DrillThroughTarget> targets)
+    private static void AddTargetIfDrillThrough(
+        JsonElement pageElement,
+        List<DrillThroughTarget> targets,
+        bool requirePageBinding)
     {
         // A page is a drill-through destination if EITHER shape says so:
         //  - Modern PBIR: the page declares "pageBinding": { "type": "Drillthrough" }, and its filters are
@@ -1029,7 +1093,7 @@ public sealed class PowerBiEmbedService : IPowerBiEmbedService
         var isDrillThroughPage = IsDrillThroughPageBinding(pageElement);
 
         var fields = ExtractDrillThroughFields(pageElement, isDrillThroughPage);
-        if (!isDrillThroughPage && fields.Count == 0)
+        if (!isDrillThroughPage && (requirePageBinding || fields.Count == 0))
         {
             return;
         }

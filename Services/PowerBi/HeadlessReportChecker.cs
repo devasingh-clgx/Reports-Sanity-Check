@@ -1,4 +1,5 @@
-﻿using System.Text.Json;
+﻿using System.Diagnostics;
+using System.Text.Json;
 using Microsoft.Extensions.Options;
 using Microsoft.Playwright;
 using Reports_Sanity_Check.Services.PowerBi.Models;
@@ -14,22 +15,12 @@ public sealed record HeadlessCheckOptions
     public int RenderTimeoutMs { get; init; }
     public int BookmarkApplyTimeoutMs { get; init; }
     public int OverallTimeoutMs { get; init; }
-    public bool CheckBookmarks { get; init; }
-
-    /// <summary>When true, every page (including hidden drill-through pages) is rendered and checked.</summary>
-    public bool CheckAllPages { get; init; }
 
     /// <summary>Maximum time to wait for a page to re-render after it is activated.</summary>
     public int PageTimeoutMs { get; init; }
 
     /// <summary>Upper bound on pages rendered per report (already resolved; <see cref="int.MaxValue"/> = unlimited).</summary>
     public int MaxPagesPerReport { get; init; }
-
-    /// <summary>When true, the runner drives table/matrix drill-through via the report context menu (DOM-driven).</summary>
-    public bool CheckDrillThrough { get; init; }
-
-    /// <summary>When true, the runner flips toggle-style custom visuals (e.g. BENE.BIZ Toggle Switch) and re-checks.</summary>
-    public bool CheckToggles { get; init; }
 
     /// <summary>Time to wait after an interaction for the report to settle/re-render, in ms.</summary>
     public int InteractionSettleMs { get; init; }
@@ -58,6 +49,7 @@ public sealed record HeadlessCheckOptions
 
     /// <summary>How many reports to render concurrently (each in its own browser tab).</summary>
     public int MaxParallelReports { get; init; }
+
 }
 
 /// <summary>
@@ -92,7 +84,10 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
 
     private readonly ILogger<HeadlessReportChecker> _logger;
 
-    public HeadlessReportChecker(ILogger<HeadlessReportChecker> logger) => _logger = logger;
+    public HeadlessReportChecker(ILogger<HeadlessReportChecker> logger)
+    {
+        _logger = logger;
+    }
 
     public async Task<IReadOnlyList<ReportCheckInteropResult>> CheckReportsAsync(
         Uri hostBaseUri,
@@ -108,6 +103,8 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
 
         var hostPageUrl = new Uri(hostBaseUri, HostPagePath).ToString();
         var maxParallel = Math.Clamp(options.MaxParallelReports, 1, 10);
+        var runStopwatch = Stopwatch.StartNew();
+        var setupStopwatch = Stopwatch.StartNew();
 
         using var playwright = await Playwright.CreateAsync();
 
@@ -131,10 +128,12 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
             ViewportSize = new ViewportSize { Width = 1600, Height = 1200 },
             IgnoreHTTPSErrors = true
         });
+        setupStopwatch.Stop();
 
         _logger.LogInformation(
-            "Headless check starting for {Count} report(s) via {HostPageUrl} (max parallel {MaxParallel}).",
-            embeds.Count, hostPageUrl, maxParallel);
+            "Headless check starting for {Count} report(s) via {HostPageUrl} (max parallel {MaxParallel}); " +
+            "Playwright/browser/context setup took {SetupMs} ms.",
+            embeds.Count, hostPageUrl, maxParallel, setupStopwatch.ElapsedMilliseconds);
 
         // Render reports in chunks the size of the parallel pool; each report gets its own page (an
         // isolated DOM) so several can render at once without colliding on the single container id.
@@ -148,7 +147,13 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
 
             var tasks = chunk.Select(async index =>
             {
-                results[index] = await CheckSingleReportAsync(context, hostPageUrl, embeds[index], options, cancellationToken);
+                results[index] = await CheckSingleReportAsync(
+                    context,
+                    hostPageUrl,
+                    embeds[index],
+                    options,
+                    runStopwatch,
+                    cancellationToken);
             });
 
             await Task.WhenAll(tasks);
@@ -162,6 +167,7 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
         string hostPageUrl,
         EmbedConfig embed,
         HeadlessCheckOptions options,
+        Stopwatch contextStopwatch,
         CancellationToken cancellationToken)
     {
         if (string.IsNullOrEmpty(embed.EmbedToken))
@@ -175,6 +181,11 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
         }
 
         IPage? page = null;
+        var pageStopwatch = Stopwatch.StartNew();
+        var performance = new PerformanceDiagnostics
+        {
+            ContextAgeAtStartMs = contextStopwatch.ElapsedMilliseconds
+        };
 
         // Hard guard: the browser module always resolves via its own deadline, but if a page hangs we
         // force-close it after the overall budget plus a buffer so the run can't stall indefinitely.
@@ -183,21 +194,29 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
 
         try
         {
+            var phaseStopwatch = Stopwatch.StartNew();
             page = await context.NewPageAsync();
+            AddPhase(performance, "Page create", phaseStopwatch);
             var activePage = page;
             await using var registration = timeoutCts.Token.Register(() => _ = activePage.CloseAsync());
 
+            phaseStopwatch.Restart();
             await page.GotoAsync(hostPageUrl, new PageGotoOptions
             {
                 WaitUntil = WaitUntilState.DOMContentLoaded,
                 Timeout = options.OverallTimeoutMs
             });
+            AddPhase(performance, "Host navigation", phaseStopwatch);
 
             // The host page imports the module asynchronously; wait until checkReport is exposed.
+            phaseStopwatch.Restart();
             await page.WaitForFunctionAsync(
                 "() => window.__sanityReady === true && typeof window.__sanityCheckReport === 'function'",
                 null,
                 new PageWaitForFunctionOptions { Timeout = options.RenderTimeoutMs });
+            AddPhase(performance, "Host ready", phaseStopwatch);
+            performance.ResourceSamples.Add(await CaptureBrowserResourceSampleAsync(
+                page, "Host ready", pageStopwatch.ElapsedMilliseconds));
 
             // The browser module reads camelCase keys, so pass explicit camelCase payloads. The result
             // is JSON.stringify'd in the browser and deserialized here with the app's own options so we
@@ -215,13 +234,13 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                     renderTimeoutMs = options.RenderTimeoutMs,
                     bookmarkApplyTimeoutMs = options.BookmarkApplyTimeoutMs,
                     overallTimeoutMs = options.OverallTimeoutMs,
-                    checkBookmarks = options.CheckBookmarks,
-                    checkAllPages = options.CheckAllPages,
+                    checkBookmarks = true,
+                    checkAllPages = true,
                     pageTimeoutMs = options.PageTimeoutMs,
                     maxPagesPerReport = options.MaxPagesPerReport,
                     // Tell the browser module to keep the embedded report alive after the SDK checks so
                     // the DOM-driven interaction pass below can observe its error events.
-                    runInteractions = options.CheckDrillThrough || options.CheckToggles
+                    runInteractions = true
                 },
                 containerId = ContainerId
             };
@@ -231,7 +250,9 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                 return JSON.stringify(result);
             }";
 
+            phaseStopwatch.Restart();
             var json = await page.EvaluateAsync<string>(expression, arg);
+            AddPhase(performance, "SDK total", phaseStopwatch);
 
             var interop = JsonSerializer.Deserialize<ReportCheckInteropResult>(json, JsonOptions);
             if (interop is null)
@@ -243,16 +264,48 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                 };
             }
 
+            interop.Performance = performance;
+            performance.Phases.Add(new PerformancePhase
+            {
+                Name = "SDK initial render",
+                DurationMs = interop.RenderDurationMs,
+                Count = 1
+            });
+            performance.Phases.Add(new PerformancePhase
+            {
+                Name = "SDK bookmark traversal",
+                DurationMs = interop.Bookmarks.Sum(bookmark => bookmark.DurationMs),
+                Count = interop.Bookmarks.Count
+            });
+            performance.Phases.Add(new PerformancePhase
+            {
+                Name = "SDK page traversal",
+                DurationMs = interop.Pages.Sum(reportPage => reportPage.DurationMs),
+                Count = interop.Pages.Count
+            });
+            performance.ResourceSamples.Add(await CaptureBrowserResourceSampleAsync(
+                page, "After SDK checks", pageStopwatch.ElapsedMilliseconds));
+
             // DOM-driven interactions the embed SDK cannot trigger: drill-through from a table/matrix
             // (right-click a data row -> "Drill through") and flipping toggle-style custom visuals. Best
             // effort: failures here are recorded per interaction and never throw. Only runs if the report
             // rendered, so we don't fight an already-broken embed.
-            if ((options.CheckDrillThrough || options.CheckToggles)
-                && interop.Status is SanityStatus.Passed or SanityStatus.Failed)
+            if (interop.Status is SanityStatus.Passed or SanityStatus.Failed)
             {
                 try
                 {
-                    interop.Interactions = await RunInteractionsAsync(page, options, interop.DrillThrough, embed.DrillThroughTargets, embed.VisualDefinitions, timeoutCts.Token);
+                    phaseStopwatch.Restart();
+                    interop.Interactions = await RunInteractionsAsync(
+                        page,
+                        options,
+                        interop.DrillThrough,
+                        embed.DrillThroughTargets,
+                        embed.VisualDefinitions,
+                        performance,
+                        timeoutCts.Token);
+                    AddPhase(performance, "Interaction total", phaseStopwatch, interop.Interactions.Count);
+                    performance.ResourceSamples.Add(await CaptureBrowserResourceSampleAsync(
+                        page, "After interactions", pageStopwatch.ElapsedMilliseconds));
                     FoldInteractionOutcome(interop);
                 }
                 catch (Exception ex) when (!timeoutCts.IsCancellationRequested)
@@ -263,10 +316,25 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                 finally
                 {
                     // Always release the kept-alive report so the next report in this page's pool starts clean.
+                    phaseStopwatch.Restart();
                     try { await page.EvaluateAsync("() => window.__sanityEndInteractions && window.__sanityEndInteractions()"); }
                     catch { /* best-effort */ }
+                    AddPhase(performance, "Interaction cleanup", phaseStopwatch);
                 }
             }
+
+            _logger.LogInformation(
+                "Performance report {ReportId}: context {ContextStartMs}-{ContextEndMs} ms, page {PageLifetimeMs} ms, " +
+                "phases [{Phases}], peak browser working set {PeakBrowserMb:F1} MB, peak JS heap {PeakHeapMb:F1} MB.",
+                embed.ReportId,
+                performance.ContextAgeAtStartMs,
+                contextStopwatch.ElapsedMilliseconds,
+                pageStopwatch.ElapsedMilliseconds,
+                string.Join("; ", performance.Phases.Select(item =>
+                    $"{item.Name}={item.DurationMs}ms/{item.Count}" +
+                    (string.IsNullOrEmpty(item.Scope) ? string.Empty : $" ({item.Scope})"))),
+                performance.PeakBrowserWorkingSetBytes / 1024d / 1024d,
+                performance.PeakJavaScriptHeapUsedBytes / 1024d / 1024d);
 
             return interop;
         }
@@ -291,8 +359,19 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
         }
         finally
         {
+            performance.ContextAgeAtEndMs = contextStopwatch.ElapsedMilliseconds;
+            performance.PageLifetimeMs = pageStopwatch.ElapsedMilliseconds;
             if (page is not null)
             {
+                try
+                {
+                    performance.ResourceSamples.Add(await CaptureBrowserResourceSampleAsync(
+                        page, "Before page close", pageStopwatch.ElapsedMilliseconds));
+                }
+                catch
+                {
+                    // The timeout guard may already have closed the page.
+                }
                 try
                 {
                     await page.CloseAsync();
@@ -303,6 +382,88 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                 }
             }
         }
+    }
+
+    private static void AddPhase(
+        PerformanceDiagnostics diagnostics,
+        string name,
+        Stopwatch stopwatch,
+        int count = 0,
+        string? scope = null)
+    {
+        stopwatch.Stop();
+        diagnostics.Phases.Add(new PerformancePhase
+        {
+            Name = name,
+            DurationMs = stopwatch.ElapsedMilliseconds,
+            Count = count,
+            Scope = scope
+        });
+    }
+
+    private static async Task<BrowserResourceSample> CaptureBrowserResourceSampleAsync(
+        IPage page,
+        string phase,
+        long elapsedMs)
+    {
+        var sample = new BrowserResourceSample { Phase = phase, ElapsedMs = elapsedMs };
+
+        try
+        {
+            var heap = await page.EvaluateAsync<long[]>(
+                "() => performance.memory ? [performance.memory.usedJSHeapSize, performance.memory.totalJSHeapSize] : [0, 0]");
+            sample.JavaScriptHeapUsedBytes = heap.ElementAtOrDefault(0);
+            sample.JavaScriptHeapTotalBytes = heap.ElementAtOrDefault(1);
+        }
+        catch
+        {
+            // The page may be closing; retain the process sample if available.
+        }
+
+        ICDPSession? session = null;
+        try
+        {
+            session = await page.Context.NewCDPSessionAsync(page);
+            var processInfo = await session.SendAsync("SystemInfo.getProcessInfo");
+            if (processInfo is JsonElement root &&
+                root.TryGetProperty("processInfo", out var processes) &&
+                processes.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var processElement in processes.EnumerateArray())
+                {
+                    if (!processElement.TryGetProperty("id", out var idElement) ||
+                        !idElement.TryGetInt32(out var processId))
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        using var process = Process.GetProcessById(processId);
+                        sample.BrowserWorkingSetBytes += process.WorkingSet64;
+                        sample.BrowserPrivateMemoryBytes += process.PrivateMemorySize64;
+                        sample.BrowserProcessCount++;
+                    }
+                    catch
+                    {
+                        // A short-lived Chromium utility process can exit between enumeration and sampling.
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Browser process sampling is best-effort and must not affect report coverage.
+        }
+        finally
+        {
+            if (session is not null)
+            {
+                await session.DetachAsync();
+            }
+        }
+
+        return sample;
     }
 
     /// <summary>
@@ -319,6 +480,7 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
         DrillThroughDiagnostics diagnostics,
         IReadOnlyList<DrillThroughTarget> declaredTargets,
         IReadOnlyList<ReportVisualDefinition> visualDefinitions,
+        PerformanceDiagnostics performance,
         CancellationToken cancellationToken)
     {
         var results = new List<InteractionCheckResult>();
@@ -339,12 +501,15 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
         // destinations and are intentionally excluded here (they are reached via the drill-through action
         // itself). If page enumeration isn't available we fall back to the single landing page so behavior
         // degrades gracefully.
+        var phaseStopwatch = Stopwatch.StartNew();
         var pages = await GetVisiblePagesForInteractionAsync(page);
+        AddPhase(performance, "Interaction page discovery", phaseStopwatch, pages.Count);
         if (pages.Count == 0)
         {
             pages = new List<VisiblePage> { new VisiblePage(string.Empty, "(current page)") };
         }
 
+        phaseStopwatch.Restart();
         foreach (var visiblePage in pages)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -359,39 +524,41 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                     diagnostics.Notes.Add($"[page '{visiblePage.DisplayName}'] could not be activated; skipped.");
                     continue;
                 }
-                await page.WaitForTimeoutAsync(options.InteractionSettleMs);
             }
 
             diagnostics.Notes.Add($"[page '{visiblePage.DisplayName}'] running interaction passes.");
 
-            if (options.CheckToggles)
-            {
-                // Toggles may exist on any page; don't emit a "no toggle" note per page (it would be noisy),
-                // only when none were found across the whole report (handled by reportWhenNone: false here).
-                await RunToggleInteractionsAsync(page, frame, options, results, cancellationToken, reportWhenNone: false);
-            }
-
-            if (options.CheckDrillThrough)
-            {
-                // PRIMARY drill-through pass is DOM-first and runs AFTER this visible-page loop so it can
-                // explore every visible page and recurse into destinations. Nothing to do per-page here.
-            }
+            // Toggles may exist on any page; don't emit a "no toggle" note per page (it would be noisy),
+            // only when none were found across the whole report (handled by reportWhenNone: false here).
+            await RunToggleInteractionsAsync(
+                page,
+                frame,
+                options,
+                results,
+                cancellationToken,
+                reportWhenNone: false);
         }
+        AddPhase(performance, "Visible page and toggle traversal", phaseStopwatch, pages.Count);
 
-        if (options.CheckDrillThrough)
-        {
-            var state = new DrillExploreState();
+        var state = new DrillExploreState();
 
-            var interactionBudgetMs = Math.Max(30_000, Math.Min(
-                (int)(options.OverallTimeoutMs * 0.6),
-                options.OverallTimeoutMs - 30_000));
-            state.Deadline = DateTime.UtcNow.AddMilliseconds(interactionBudgetMs);
+        var interactionBudgetMs = Math.Max(30_000, Math.Min(
+            (int)(options.OverallTimeoutMs * 0.6),
+            options.OverallTimeoutMs - 30_000));
+        state.Deadline = DateTime.UtcNow.AddMilliseconds(interactionBudgetMs);
+        phaseStopwatch.Restart();
+        var bookmarks = await GetApplyableBookmarksAsync(page);
+        AddPhase(performance, "Interaction bookmark discovery", phaseStopwatch, bookmarks.Count);
 
             // Drill-through lives on real data visuals (e.g. a summary table). Explore each visible page in
             // its default state; drill-through destination pages are hidden and reached via the action.
             foreach (var visiblePage in pages)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                if (IsNativeCoverageComplete(declaredTargets))
+                {
+                    break;
+                }
                 if (state.BudgetExpired)
                 {
                     diagnostics.Notes.Add(
@@ -407,7 +574,6 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                     {
                         continue;
                     }
-                    await page.WaitForTimeoutAsync(options.InteractionSettleMs);
                 }
 
                 await page.EvaluateAsync("() => window.__sanityBeginInteractions && window.__sanityBeginInteractions()");
@@ -416,25 +582,94 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                 // for its own data. A visual that projects every field a declared destination filters on
                 // IS a drill-through source, and its first data row is exactly where the right-click must
                 // land. This is derived from the report's own metadata, so it holds for any report.
+                phaseStopwatch.Restart();
                 await DiscoverDrillThroughSourcesAsync(
                     page, diagnostics, declaredTargets, visualDefinitions, visiblePage.Name, visiblePage.DisplayName, cancellationToken);
+                AddPhase(performance, "Source discovery", phaseStopwatch, scope: visiblePage.DisplayName);
 
+                phaseStopwatch.Restart();
                 await ExploreDrillThroughAsync(
-                    page, options, results, diagnostics, state, depth: 1,
+                    page, options, results, diagnostics, declaredTargets, visualDefinitions, performance, state, depth: 1,
                     pathPrefix: visiblePage.DisplayName, cancellationToken);
+                AddPhase(performance, "Native candidate probing", phaseStopwatch, scope: visiblePage.DisplayName);
+
+                if (IsNativeCoverageComplete(declaredTargets))
+                {
+                    break;
+                }
+
+                // Some authored bookmarks materialize tables/charts that do not exist in the default DOM.
+                // Exercise each leaf bookmark as a separate source state, then scope all probes to the
+                // metadata-identified source visual ids. This is required for reports where a tab/bookmark
+                // controls which source matrix is rendered.
+                foreach (var bookmark in bookmarks)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (IsNativeCoverageComplete(declaredTargets))
+                    {
+                        break;
+                    }
+                    if (state.BudgetExpired)
+                    {
+                        break;
+                    }
+
+                    if (!string.IsNullOrEmpty(visiblePage.Name))
+                    {
+                        var restored = await SetActivePageForInteractionAsync(
+                            page, visiblePage.Name, options.InteractionSettleMs);
+                        if (!restored)
+                        {
+                            continue;
+                        }
+                    }
+
+                    phaseStopwatch.Restart();
+                    if (!await ApplyBookmarkForInteractionAsync(
+                        page, bookmark.Name, options.InteractionSettleMs))
+                    {
+                        AddPhase(performance, "Interaction bookmark apply", phaseStopwatch, scope: bookmark.DisplayName);
+                        diagnostics.Notes.Add(
+                            $"[{visiblePage.DisplayName}] bookmark '{bookmark.DisplayName}' could not be applied; skipped for drill-through.");
+                        continue;
+                    }
+                    AddPhase(performance, "Interaction bookmark apply", phaseStopwatch, 1, bookmark.DisplayName);
+
+                    await page.EvaluateAsync(
+                        "() => window.__sanityBeginInteractions && window.__sanityBeginInteractions()");
+
+                    phaseStopwatch.Restart();
+                    await ExploreDrillThroughAsync(
+                        page, options, results, diagnostics, declaredTargets, visualDefinitions, performance, state, depth: 1,
+                        pathPrefix: $"{visiblePage.DisplayName} [bookmark: {bookmark.DisplayName}]",
+                        cancellationToken);
+                    AddPhase(performance, "Bookmark-state native probing", phaseStopwatch, scope: bookmark.DisplayName);
+                }
             }
 
-            // GUARANTEED OPEN: the right-click gesture needs a rendered data cell, which is not always
-            // present. Regardless of whether it fired, open every declared destination directly with its
-            // bound field(s) as filter context so the drill-through page is always exercised and its
-            // render verified. This is the deterministic path to "the drill-through page opened".
-            await ForceOpenDeclaredTargetsAsync(page, options, results, diagnostics, declaredTargets, cancellationToken);
-        }
+            if (state.CheckedDestinations.Count > 0)
+            {
+                diagnostics.Notes.Add(
+                    $"Native drill-through destinations checked once per report: " +
+                    string.Join(", ", state.CheckedDestinations.OrderBy(name => name)) + ".");
+            }
 
-
-        // If toggles were requested but none were ever found on any page, record a single summary note so
+            var unreachedTargets = declaredTargets
+                .Where(target => target.VerificationMethod != DrillThroughVerificationMethod.RealGesture)
+                .Select(target => target.PageDisplayName)
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (unreachedTargets.Count > 0)
+            {
+                diagnostics.Notes.Add(
+                    "Declared drill-through targets not exposed by a native right-click path were left unverified " +
+                    "to avoid opening parameter-dependent pages without their real interaction context: " +
+                    string.Join(", ", unreachedTargets) + ".");
+            }
+        // If no toggles were found on any page, record a single summary note so
         // the email still explains the toggle pass ran and found nothing.
-        if (options.CheckToggles && !results.Any(r => r.Kind == InteractionKind.Toggle))
+        if (!results.Any(r => r.Kind == InteractionKind.Toggle))
         {
             results.Add(new InteractionCheckResult
             {
@@ -768,205 +1003,18 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
     }
 
     /// <summary>
-    /// Opens every declared drill-through destination page directly via the embed SDK, applying the
-    /// target's bound field(s) as page filter context, and records whether it rendered without visual
-    /// errors. This is the deterministic counterpart to the native right-click gesture: the gesture needs
-    /// a rendered source data cell, whereas this path only needs the destination page to exist, so the
-    /// drill-through page is verified even when no clickable source cell is present.
-    /// </summary>
-    private async Task ForceOpenDeclaredTargetsAsync(
-        IPage page,
-        HeadlessCheckOptions options,
-        List<InteractionCheckResult> results,
-        DrillThroughDiagnostics diagnostics,
-        IReadOnlyList<DrillThroughTarget> declaredTargets,
-        CancellationToken cancellationToken)
-    {
-        if (declaredTargets.Count == 0)
-        {
-            diagnostics.Notes.Add("Direct open skipped: no declared drill-through targets to open.");
-            return;
-        }
-
-        foreach (var target in declaredTargets)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (string.IsNullOrEmpty(target.PageName))
-            {
-                continue;
-            }
-
-            // FILTER CONTEXT FROM DISCOVERED DATA: the declared metadata names the bound field but carries
-            // no value. Source discovery already exported a real first row from every visual that projects
-            // those fields, so reuse that concrete value here. This is what makes the destination open the
-            // way a user's drill-through opens it, rather than as a bare unfiltered page.
-            var filters = new List<object>();
-            var unresolved = new List<string>();
-
-            foreach (var field in target.Fields)
-            {
-                var value = FindSampleValueForField(diagnostics, field);
-                if (string.IsNullOrEmpty(value))
-                {
-                    unresolved.Add($"{field.Table}.{field.Column}");
-                    continue;
-                }
-
-                filters.Add(new { table = field.Table, column = field.Column, value });
-            }
-
-            if (unresolved.Count > 0)
-            {
-                diagnostics.Notes.Add(
-                    $"Direct open '{target.PageDisplayName}': no sample value found for {string.Join(", ", unresolved)}.");
-            }
-
-            var filtersJson = JsonSerializer.Serialize(filters);
-
-            await page.EvaluateAsync("() => window.__sanityBeginInteractions && window.__sanityBeginInteractions()");
-
-            string outcomeJson;
-            try
-            {
-                outcomeJson = await page.EvaluateAsync<string>(
-                    @"async ([name, filtersJson, settle]) => window.__sanityOpenDrillThroughPage
-                        ? await window.__sanityOpenDrillThroughPage(name, JSON.parse(filtersJson), settle)
-                        : JSON.stringify({ opened: false, error: 'helper unavailable' })",
-                    new object[] { target.PageName, filtersJson, options.InteractionSettleMs });
-            }
-            catch (Exception ex)
-            {
-                target.Status = SanityStatus.Failed;
-                target.Message = $"Direct open threw: {ex.Message}";
-                target.VerificationMethod = DrillThroughVerificationMethod.MetadataFallback;
-                diagnostics.Notes.Add($"Direct open of '{target.PageDisplayName}' threw: {ex.Message}");
-                continue;
-            }
-
-            await page.WaitForTimeoutAsync(options.InteractionSettleMs);
-
-            var opened = false;
-            var filtersApplied = false;
-            string? error = null;
-            try
-            {
-                using var doc = JsonDocument.Parse(outcomeJson);
-                var root = doc.RootElement;
-                opened = root.TryGetProperty("opened", out var o) && o.ValueKind == JsonValueKind.True;
-                filtersApplied = root.TryGetProperty("filtersApplied", out var f) && f.ValueKind == JsonValueKind.True;
-                error = root.TryGetProperty("error", out var e) && e.ValueKind == JsonValueKind.String
-                    ? e.GetString()
-                    : null;
-            }
-            catch (JsonException)
-            {
-                error = "Unparseable open outcome.";
-            }
-
-            // Collect any visual errors raised while the destination page was active.
-            var errors = await DrainInteractionErrorsAsync(page);
-            target.Errors = errors;
-            target.VerificationMethod = DrillThroughVerificationMethod.MetadataFallback;
-
-            if (!opened)
-            {
-                target.Status = SanityStatus.Failed;
-                target.Message = $"Could not open destination page. {error}".Trim();
-            }
-            else if (errors.Count > 0)
-            {
-                target.Status = SanityStatus.Failed;
-                target.Message = $"Opened but {errors.Count} visual error(s) rendered.";
-            }
-            else if (!filtersApplied)
-            {
-                // Opened and rendered clean, but without drill-through filter context.
-                target.Status = SanityStatus.Pending;
-                target.Message = filters.Count == 0
-                    ? $"Opened without filter context (no sample value for {target.FieldSummary})."
-                    : $"Opened, but filter context was not applied. {error}".Trim();
-            }
-            else
-            {
-                target.Status = SanityStatus.Passed;
-                target.Message = "Opened with drill-through filter context; rendered without visual errors.";
-            }
-
-            diagnostics.Notes.Add(
-                $"Direct open '{target.PageDisplayName}' [{target.FieldSummary}]: " +
-                $"opened={opened}, filters={filtersApplied}, errors={errors.Count}.");
-
-            results.Add(new InteractionCheckResult
-            {
-                Kind = InteractionKind.DrillThrough,
-                Page = target.PageDisplayName,
-                Status = target.Status,
-                Message = target.Message,
-                Errors = errors
-            });
-        }
-
-        // Leave the report on a visible page so later phases don't start from a hidden destination.
-        var visible = await GetVisiblePagesForInteractionAsync(page);
-        if (visible.Count > 0)
-        {
-            await SetActivePageForInteractionAsync(page, visible[0].Name, options.InteractionSettleMs);
-        }
-    }
-
-    /// <summary>
-    /// Finds a concrete sample value for a drill-through bound field from the rows already exported during
-    /// source discovery. Prefers a visual that was matched on this exact field (its MatchedFields carry the
-    /// resolved value), then falls back to any exported first row whose column matches by name. Returns
-    /// null when no visual on the page produced a usable row for the field.
-    /// </summary>
-    private static string? FindSampleValueForField(DrillThroughDiagnostics diagnostics, DrillThroughField field)
-    {
-        var column = field.Column;
-
-        bool ColumnMatches(string candidate) =>
-            string.Equals(candidate, column, StringComparison.OrdinalIgnoreCase)
-            || candidate.EndsWith($".{column}", StringComparison.OrdinalIgnoreCase);
-
-        // Preferred: a visual explicitly matched to this bound field, with the value already resolved.
-        var matched = diagnostics.SourceVisuals
-            .Where(v => v.IsDrillThroughSource)
-            .SelectMany(v => v.MatchedFields)
-            .FirstOrDefault(m => ColumnMatches(m.Column) && !string.IsNullOrEmpty(m.Value));
-
-        if (matched is not null)
-        {
-            return matched.Value;
-        }
-
-        // Fallback: any exported first row that happens to contain the column. The exported header is the
-        // visual's DISPLAY name, which often differs from the model column name, so also accept a match on
-        // the trailing segment of either side.
-        foreach (var visual in diagnostics.SourceVisuals)
-        {
-            var cell = visual.FirstRow.FirstOrDefault(c =>
-                !string.IsNullOrEmpty(c.Value) && ColumnMatches(c.Column));
-
-            if (cell is not null)
-            {
-                return cell.Value;
-            }
-        }
-
-        return null;
-    }
-
-    /// <summary>A source visual/value discovered for a drill-through target's bound field.</summary>
-
-    /// <summary>
     /// Best-effort attempt to open the context menu on a data element, trying SEVERAL gesture strategies
     /// in turn because Power BI visuals differ in how they accept a right-click: (1) a plain right-click,
     /// (2) hover-then-right-click (some charts only arm a mark on hover), (3) a right-click at the element's
     /// bounding-box center via the mouse (bypasses odd hit-testing), and (4) left-click to select then the
     /// keyboard context-menu key. Returns true as soon as one strategy fires without throwing.
     /// </summary>
-    private async Task<bool> TryRightClickAsync(IPage page, ILocator locator, int timeoutMs)
+    private async Task<bool> TryRightClickAsync(
+        IPage page,
+        ILocator locator,
+        int timeoutMs,
+        string checkpointContext,
+        CancellationToken cancellationToken)
     {
         var budget = Math.Min(timeoutMs, 8000);
 
@@ -1040,6 +1088,9 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
     {
         public int Performed;
         public readonly HashSet<string> VisitedPages = new(StringComparer.OrdinalIgnoreCase);
+        public readonly HashSet<string> CheckedDestinations = new(StringComparer.OrdinalIgnoreCase);
+        public readonly HashSet<string> DestinationsInProgress = new(StringComparer.OrdinalIgnoreCase);
+        public readonly HashSet<string> ProbedSourceVisuals = new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>Wall-clock deadline for the whole drill-through exploration phase. When reached the
         /// explorer stops gracefully and returns partial results instead of being force-killed by the
@@ -1047,6 +1098,23 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
         public DateTime Deadline = DateTime.MaxValue;
 
         public bool BudgetExpired => DateTime.UtcNow >= Deadline;
+    }
+
+    private static bool IsNativeCoverageComplete(IReadOnlyList<DrillThroughTarget> declaredTargets)
+    {
+        var actionableTargets = declaredTargets
+            .Where(target => target.Fields.Count > 0)
+            .GroupBy(
+                target => string.IsNullOrWhiteSpace(target.PageDisplayName)
+                    ? target.PageName
+                    : target.PageDisplayName,
+                StringComparer.OrdinalIgnoreCase)
+            .Where(group => !string.IsNullOrWhiteSpace(group.Key))
+            .ToList();
+
+        return actionableTargets.Count > 0 && actionableTargets.All(group => group.Any(target =>
+            target.Status == SanityStatus.Passed &&
+            target.VerificationMethod == DrillThroughVerificationMethod.RealGesture));
     }
 
     /// <summary>
@@ -1064,6 +1132,9 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
         HeadlessCheckOptions options,
         List<InteractionCheckResult> results,
         DrillThroughDiagnostics diagnostics,
+        IReadOnlyList<DrillThroughTarget> declaredTargets,
+        IReadOnlyList<ReportVisualDefinition> visualDefinitions,
+        PerformanceDiagnostics performance,
         DrillExploreState state,
         int depth,
         string pathPrefix,
@@ -1081,28 +1152,97 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        // Record the page we're exploring so a drill chain that loops back doesn't recurse forever.
+        // Include the full path so the same destination can be verified from different source visuals or
+        // filter contexts. MaxDrillThroughDepth remains the hard cycle guard for A -> B -> A chains.
         var currentInfo = await ActivePageInfoAsync(page);
         var currentKey = string.IsNullOrEmpty(currentInfo.Name) ? currentInfo.DisplayName : currentInfo.Name;
-        if (!string.IsNullOrEmpty(currentKey) && !state.VisitedPages.Add($"{depth}:{currentKey}"))
+        if (!string.IsNullOrEmpty(currentKey) && !state.VisitedPages.Add($"{depth}:{pathPrefix}:{currentKey}"))
         {
-            // Already explored this page at this depth in the current branch; stop to avoid cycles.
+            // An exact duplicate traversal path was already processed.
             return;
         }
 
+        if (depth > 1)
+        {
+            var sourceStopwatch = Stopwatch.StartNew();
+            await DiscoverDrillThroughSourcesAsync(
+                page,
+                diagnostics,
+                declaredTargets,
+                visualDefinitions,
+                currentInfo.Name,
+                currentInfo.DisplayName,
+                cancellationToken);
+            AddPhase(performance, "Recursive source discovery", sourceStopwatch, scope: $"depth {depth}: {pathPrefix}");
+        }
+
         var frame = page.FrameLocator($"#{ContainerId} iframe");
+        var knownSourceVisuals = diagnostics.SourceVisuals
+            .Where(v => v.IsDrillThroughSource &&
+                        !string.IsNullOrWhiteSpace(v.VisualName) &&
+                        string.Equals(v.Page, currentInfo.DisplayName, StringComparison.OrdinalIgnoreCase))
+            .GroupBy(v => v.VisualName, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.Last())
+            .ToList();
+        var sourceVisuals = knownSourceVisuals
+            .Where(source => !state.ProbedSourceVisuals.Contains(
+                $"{currentInfo.DisplayName}:{source.VisualName}"))
+            .ToList();
+
+        if (knownSourceVisuals.Count > 0 && sourceVisuals.Count == 0)
+        {
+            diagnostics.Notes.Add(
+                $"[{pathPrefix}] native menus already enumerated for every drill-through source visual; skipped duplicate probing.");
+            return;
+        }
 
         // A table/matrix renders its cells asynchronously after the page (or bookmark) is applied. Probing
-        // immediately finds zero data cells and falls through to chart marks on navigation visuals, which is
-        // why a drillable summary table can be missed entirely. Wait briefly for the first bound cell.
-        try
+        // immediately can miss a drillable summary table. When metadata identifies source visuals, wait only
+        // inside a source container that is actually visible in this bookmark state. Waiting frame-wide for
+        // ten seconds made every unrelated bookmark pay the full timeout even though its source was hidden.
+        var waitedForVisibleSource = false;
+        foreach (var source in sourceVisuals)
         {
-            await frame.Locator("[role='gridcell']")
-                .First.WaitForAsync(new() { State = WaitForSelectorState.Attached, Timeout = 10_000 });
+            var container = VisualContainerLocator(frame, source.VisualName);
+            try
+            {
+                if (!await container.IsVisibleAsync())
+                {
+                    continue;
+                }
+
+                waitedForVisibleSource = true;
+                await container.Locator(
+                        "[role='gridcell'], [role='rowheader'], [role='cell'], " +
+                        "svg rect.column, svg rect.bar, svg circle, svg path.line, svg path.slice, " +
+                        ".selectableDataPoint")
+                    .First.WaitForAsync(new() { State = WaitForSelectorState.Attached, Timeout = 10_000 });
+                break;
+            }
+            catch (TimeoutException)
+            {
+                // The visible source may be an empty visual; other candidate families still apply.
+                break;
+            }
+            catch
+            {
+                // A bookmark can replace the visual DOM during the visibility check; probe what remains.
+            }
         }
-        catch (TimeoutException)
+
+        // Without metadata there is no authoritative source container to scope to, so preserve the generic
+        // wait used by the best-effort discovery path rather than reducing coverage.
+        if (sourceVisuals.Count == 0 && !waitedForVisibleSource)
         {
-            // No table in this page/bookmark state; the chart-mark families below still apply.
+            try
+            {
+                await frame.Locator("[role='gridcell']")
+                    .First.WaitForAsync(new() { State = WaitForSelectorState.Attached, Timeout = 10_000 });
+            }
+            catch (TimeoutException)
+            {
+                // No table in this page/bookmark state; the chart-mark families below still apply.
+            }
         }
 
         // DIAGNOSTIC CENSUS: the probe has repeatedly reported zero table cells on a page that visibly
@@ -1175,17 +1315,15 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
 
         // Candidate data elements to right-click, most-to-least likely to carry a drill-through.
         //
-        // Power BI renders table/matrix cells as div[role="gridcell"] with no data-query-ref attribute and
-        // no .scrollable-cells-container ancestor in the live embed (the frame census reported gridcell > 0
-        // while cellsContainer was 0), so both of those filters matched nothing. Match the role directly and
-        // exclude only small-multiples layout containers, which are role="gridcell" but carry no data. Column
-        // headers are excluded because they open the sort/filter menu, never a drill-through.
+        // Prefer chart data marks before generic grid cells when metadata cannot identify a source visual.
+        // "Select Row" cells are accessibility/action controls rather than business data; right-clicking one
+        // can expose a destination but omit the bar/category context required by that destination.
         var candidateFamilies = new (string Kind, ILocator Locator)[]
         {
-            ("data cell", frame.Locator("[role='gridcell']")),
-            ("row header", frame.Locator("[role='rowheader']")),
             ("chart mark", frame.Locator("svg rect.column, svg rect.bar, svg circle, svg path.line, svg path.slice, .columnChart rect, .barChart rect, .scatterChart circle, .lineChart circle, .donutChart path, .pieChart path")),
             ("data point", frame.Locator("[class*='dataPoint'], [class*='data-point'], .selectableDataPoint")),
+            ("data cell", frame.Locator("[role='gridcell']").Filter(new() { HasNotTextString = "Select Row" })),
+            ("row header", frame.Locator("[role='rowheader']")),
         };
 
         // VISUAL-SCOPED CANDIDATES (preferred): ask the SDK which DATA visuals are on this page, then
@@ -1204,12 +1342,17 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                 var names = new List<string>();
                 foreach (var v in doc.RootElement.EnumerateArray())
                 {
-                    var title = v.TryGetProperty("title", out var t) ? t.GetString() : null;
-                    var type = v.TryGetProperty("type", out var ty) ? ty.GetString() : null;
-                    if (string.IsNullOrWhiteSpace(title))
+                    var name = v.TryGetProperty("name", out var n) ? n.GetString() : null;
+                    var source = sourceVisuals.FirstOrDefault(item =>
+                        string.Equals(item.VisualName, name, StringComparison.OrdinalIgnoreCase));
+                    if (source is null)
                     {
                         continue;
                     }
+
+                    var title = v.TryGetProperty("title", out var t) ? t.GetString() : null;
+                    var type = v.TryGetProperty("type", out var ty) ? ty.GetString() : null;
+                    title = string.IsNullOrWhiteSpace(title) ? source.Title : title;
 
                     names.Add($"{title} [{type}]");
 
@@ -1218,18 +1361,16 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                     // visual-scoped family reported zero candidates while the frame census proved the
                     // cells existed. Match both shapes, and accept the labelled element itself as the
                     // container when no wrapper element is present.
-                    var label = EscapeForCss(title);
-                    var container = frame.Locator(
-                        $"visual-container[aria-label*={label}], " +
-                        $".visualContainer[aria-label*={label}], " +
-                        $"visual-container:has([aria-label*={label}]), " +
-                        $".visualContainer:has([aria-label*={label}])").First;
+                    var container = VisualContainerLocator(frame, source.VisualName);
 
                     visualScoped.Add((
-                        $"{title} cell",
+                        $"source visual '{title}' [{type}] data cell",
+                        container.Locator("[role='gridcell'], [role='rowheader'], [role='cell']")));
+                    visualScoped.Add((
+                        $"source visual '{title}' [{type}] chart mark",
                         container.Locator(
-                            "[role='gridcell'], [role='rowheader'], [role='columnheader'], [role='cell'], " +
-                            "svg rect, svg circle, svg path, .selectableDataPoint")));
+                            "svg rect.column, svg rect.bar, svg circle, svg path.line, svg path.slice, " +
+                            ".selectableDataPoint, [class*='dataPoint'], [class*='data-point']")));
                 }
 
                 diagnostics.Notes.Add(
@@ -1245,8 +1386,12 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
             diagnostics.Notes.Add($"[{pathPrefix}] SDK data visual lookup failed: {ex.Message}");
         }
 
-        // Probe the real data visuals first, then fall back to the generic families.
-        candidateFamilies = visualScoped.Concat(candidateFamilies).ToArray();
+        // When metadata identifies source visuals, never fall back to frame-wide candidates. The audit
+        // proved those selectors hit cards, tab navigators, slicers, and Back controls. A missing scoped
+        // source is an honest "not rendered in this state", not permission to click unrelated chrome.
+        candidateFamilies = visualScoped.Count > 0 || sourceVisuals.Count > 0
+            ? visualScoped.ToArray()
+            : candidateFamilies;
 
         // VALUE-TEXT CANDIDATES (highest fidelity): right-click the ACTUAL rendered value, e.g. the "IA"
         // cell of the Assignee Type Table. Source discovery already exported those values, so target them
@@ -1257,25 +1402,27 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
         var valueCandidates = new List<(string Kind, ILocator Locator)>();
         var seenValues = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var visual in diagnostics.SourceVisuals.Where(v => v.IsDrillThroughSource))
+        foreach (var visual in sourceVisuals)
         {
+            var container = VisualContainerLocator(frame, visual.VisualName);
             foreach (var cell in visual.FirstRow)
             {
                 var value = cell.Value?.Trim();
+                var visualValueKey = $"{visual.VisualName}:{value}";
 
                 // Only non-numeric, reasonably short values: a category label like "IA" identifies a data
                 // point, whereas "0" matches axis ticks and chrome all over the canvas.
                 if (string.IsNullOrEmpty(value)
                     || value.Length > 40
                     || double.TryParse(value, out _)
-                    || !seenValues.Add(value))
+                    || !seenValues.Add(visualValueKey))
                 {
                     continue;
                 }
 
                 valueCandidates.Add((
                     $"value '{value}' ({visual.Title})",
-                    frame.Locator($"text={value}")));
+                    container.GetByText(value, new LocatorGetByTextOptions { Exact = true })));
             }
         }
 
@@ -1288,6 +1435,7 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
         candidateFamilies = valueCandidates.Concat(candidateFamilies).ToArray();
 
         const int maxMarksPerFamily = 8;
+        var probedSourceKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var (kind, locator) in candidateFamilies)
         {
@@ -1336,22 +1484,47 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
 
                 // Identify the owning visual and bound field BEFORE right-clicking, so the probe record is
                 // complete even when the menu turns out to have no drill-through.
+                var owningVisual = await OwningVisualNameAsync(mark);
+                var sourceVisual = sourceVisuals.FirstOrDefault(source =>
+                    kind.Contains(source.Title, StringComparison.OrdinalIgnoreCase) ||
+                    owningVisual.Contains(source.Title, StringComparison.OrdinalIgnoreCase) ||
+                    owningVisual.Contains(source.VisualName, StringComparison.OrdinalIgnoreCase));
+                var sourceKey = sourceVisual is null
+                    ? null
+                    : $"{currentInfo.DisplayName}:{sourceVisual.VisualName}";
+                if (sourceKey is not null && state.ProbedSourceVisuals.Contains(sourceKey))
+                {
+                    continue;
+                }
                 var probe = new DrillThroughProbe
                 {
                     Page = currentInfo.DisplayName,
-                    Visual = await OwningVisualNameAsync(mark),
+                    Visual = owningVisual,
                     ElementKind = kind,
                     FieldRef = await SafeAttributeAsync(mark, "title")
-                               ?? await SafeAttributeAsync(mark, "aria-label")
+                               ?? await SafeAttributeAsync(mark, "aria-label"),
+                    ClickedData = await ReadClickedDataAsync(mark),
+                    SourceRow = sourceVisual?.FirstRow
+                        .Select(cell => new DrillThroughCell { Column = cell.Column, Value = cell.Value })
+                        .ToList() ?? new List<DrillThroughCell>()
                 };
                 diagnostics.Probes.Add(probe);
 
                 // Open the context menu on this data element.
                 await page.EvaluateAsync("() => window.__sanityBeginInteractions && window.__sanityBeginInteractions()");
-                var opened = await TryRightClickAsync(page, mark, options.PageTimeoutMs);
+                var opened = await TryRightClickAsync(
+                    page,
+                    mark,
+                    options.PageTimeoutMs,
+                    $"{pathPrefix}-{kind}-{i + 1}",
+                    cancellationToken);
                 if (!opened)
                 {
                     continue;
+                }
+                if (sourceKey is not null)
+                {
+                    probedSourceKeys.Add(sourceKey);
                 }
 
                 // Record every menu item that appeared, so a wrong-element right-click (e.g. a sort menu)
@@ -1361,7 +1534,12 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                     m => string.Equals(m, options.DrillThroughMenuText, StringComparison.OrdinalIgnoreCase));
 
                 // Read the "Drill through" submenu of destination page(s) from the native menu.
-                var targets = await EnumerateDrillThroughTargetsAsync(page, frame, options);
+                var targets = await EnumerateDrillThroughTargetsAsync(
+                    page,
+                    frame,
+                    options,
+                    $"{pathPrefix}-{kind}-{i + 1}",
+                    cancellationToken);
                 probe.Targets = targets;
 
                 if (targets.Count == 0)
@@ -1374,8 +1552,15 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
 
                 foreach (var targetLabel in targets)
                 {
+                    if (state.CheckedDestinations.Contains(targetLabel) ||
+                        !state.DestinationsInProgress.Add(targetLabel))
+                    {
+                        continue;
+                    }
+
                     if (state.Performed >= options.MaxInteractionsPerReport)
                     {
+                        state.DestinationsInProgress.Remove(targetLabel);
                         diagnostics.CapReached = true;
                         await DismissMenuAsync(page);
                         return;
@@ -1388,10 +1573,13 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
 
                     state.Performed++;
                     var drillPath = string.IsNullOrEmpty(pathPrefix) ? targetLabel : $"{pathPrefix} -> {targetLabel}";
+                    var dataContext = string.IsNullOrWhiteSpace(probe.ClickedDataSummary)
+                        ? string.Empty
+                        : $" using [{probe.ClickedDataSummary}]";
                     var result = new InteractionCheckResult
                     {
                         Kind = InteractionKind.DrillThrough,
-                        Target = $"Drill through ({kind}) to '{targetLabel}'",
+                        Target = $"Drill through ({kind}) to '{targetLabel}'{dataContext}",
                         Page = currentInfo.DisplayName
                     };
                     var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -1400,8 +1588,19 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                     {
                         // Re-open the menu for THIS target (a previous target click navigated away/closed it).
                         await page.EvaluateAsync("() => window.__sanityBeginInteractions && window.__sanityBeginInteractions()");
-                        var reopened = await TryRightClickAsync(page, mark, options.PageTimeoutMs);
-                        var clicked = reopened && await ClickDrillThroughTargetAsync(page, frame, options, targetLabel);
+                        var reopened = await TryRightClickAsync(
+                            page,
+                            mark,
+                            options.PageTimeoutMs,
+                            $"reopen-{drillPath}",
+                            cancellationToken);
+                        var clicked = reopened && await ClickDrillThroughTargetAsync(
+                            page,
+                            frame,
+                            options,
+                            targetLabel,
+                            drillPath,
+                            cancellationToken);
 
                         if (!clicked)
                         {
@@ -1409,8 +1608,10 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                             result.Message = $"Drill through '{targetLabel}' ({drillPath}) could not be clicked; skipped.";
                             await DismissMenuAsync(page);
                         }
+
                         else
                         {
+                            state.CheckedDestinations.Add(targetLabel);
                             await page.WaitForTimeoutAsync(Math.Max(options.InteractionSettleMs, 1500));
 
                             var destInfo = await ActivePageInfoAsync(page);
@@ -1431,15 +1632,32 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                                 result.Message = $"Drilled through to '{landed}' ({drillPath}); rendered without visual errors.";
                             }
 
-                            // Also flip toggles that only exist on this destination page.
-                            if (options.CheckToggles)
+                            var declaredTarget = declaredTargets.FirstOrDefault(target =>
+                                string.Equals(target.PageDisplayName, targetLabel, StringComparison.OrdinalIgnoreCase) ||
+                                string.Equals(target.PageName, targetLabel, StringComparison.OrdinalIgnoreCase));
+                            if (declaredTarget is not null)
                             {
-                                await RunToggleInteractionsAsync(page, frame, options, results, cancellationToken, reportWhenNone: false);
+                                declaredTarget.Status = result.Status;
+                                declaredTarget.Message = result.Message;
+                                declaredTarget.Errors = errors.ToList();
+                                declaredTarget.VerificationMethod = DrillThroughVerificationMethod.RealGesture;
                             }
 
+                            // Also flip toggles that only exist on this destination page.
+                            await RunToggleInteractionsAsync(
+                                page,
+                                frame,
+                                options,
+                                results,
+                                cancellationToken,
+                                reportWhenNone: false);
+
                             // RECURSE: follow further drill-through levels from the destination page.
+                            var recursionStopwatch = Stopwatch.StartNew();
                             await ExploreDrillThroughAsync(
-                                page, options, results, diagnostics, state, depth + 1, drillPath, cancellationToken);
+                                page, options, results, diagnostics, declaredTargets, visualDefinitions,
+                                performance, state, depth + 1, drillPath, cancellationToken);
+                            AddPhase(performance, "Drill recursion", recursionStopwatch, scope: $"depth {depth + 1}: {drillPath}");
                         }
                     }
                     catch (OperationCanceledException)
@@ -1454,21 +1672,23 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                     }
                     finally
                     {
+                        state.DestinationsInProgress.Remove(targetLabel);
                         sw.Stop();
                         result.DurationMs = sw.ElapsedMilliseconds;
                         results.Add(result);
 
                         // Return to the page this branch started on before trying the next target/mark.
-                        await ReturnToBaselineAsync(page);
+                        await ReturnToBaselineAsync(page, cancellationToken);
                         if (!string.IsNullOrEmpty(currentInfo.Name))
                         {
                             await SetActivePageForInteractionAsync(page, currentInfo.Name, options.InteractionSettleMs);
                         }
-                        await page.WaitForTimeoutAsync(options.InteractionSettleMs);
                     }
                 }
             }
         }
+
+        state.ProbedSourceVisuals.UnionWith(probedSourceKeys);
     }
 
     /// <summary>
@@ -1477,6 +1697,14 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
     /// </summary>
     private static string EscapeForCss(string value) =>
         "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+
+    private static ILocator VisualContainerLocator(IFrameLocator frame, string visualName)
+    {
+        var labelId = EscapeForCss($"visualsLabel-{visualName}");
+        return frame.Locator(
+            $"visual-container:has([id={labelId}]), " +
+            $".visualContainer:has([id={labelId}])").First;
+    }
 
     private static async Task<string> OwningVisualNameAsync(ILocator mark)
     {
@@ -1510,6 +1738,54 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
         }
     }
 
+    private static async Task<List<DrillThroughCell>> ReadClickedDataAsync(ILocator locator)
+    {
+        try
+        {
+            var json = await locator.EvaluateAsync<string>(
+                @"element => JSON.stringify({
+                    text: (element.textContent || '').trim().slice(0, 200),
+                    attributes: Array.from(element.attributes || [])
+                        .filter(attribute => attribute.name.startsWith('data-')
+                            || attribute.name === 'aria-label'
+                            || attribute.name === 'title')
+                        .map(attribute => ({ name: attribute.name, value: attribute.value.slice(0, 200) }))
+                })");
+            using var document = JsonDocument.Parse(json);
+            var cells = new List<DrillThroughCell>();
+            var root = document.RootElement;
+
+            if (root.TryGetProperty("text", out var textElement))
+            {
+                var text = textElement.GetString();
+                if (!string.IsNullOrWhiteSpace(text))
+                {
+                    cells.Add(new DrillThroughCell { Column = "rendered text", Value = text });
+                }
+            }
+
+            if (root.TryGetProperty("attributes", out var attributes) &&
+                attributes.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var attribute in attributes.EnumerateArray())
+                {
+                    var name = GetString(attribute, "name");
+                    var value = GetString(attribute, "value");
+                    if (!string.IsNullOrWhiteSpace(name) && !string.IsNullOrWhiteSpace(value))
+                    {
+                        cells.Add(new DrillThroughCell { Column = name, Value = value });
+                    }
+                }
+            }
+
+            return cells;
+        }
+        catch
+        {
+            return new List<DrillThroughCell>();
+        }
+    }
+
     /// <summary>
     /// With a context menu OPEN, finds the "Drill through" item and returns the labels of its submenu
     /// destination page(s). Works by snapshotting the visible menu-item texts, hovering "Drill through"
@@ -1517,7 +1793,11 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
     /// no drill-through on the right-clicked data point. Never throws.
     /// </summary>
     private async Task<List<string>> EnumerateDrillThroughTargetsAsync(
-        IPage page, IFrameLocator frame, HeadlessCheckOptions options)
+        IPage page,
+        IFrameLocator frame,
+        HeadlessCheckOptions options,
+        string checkpointContext,
+        CancellationToken cancellationToken)
     {
         var targets = new List<string>();
         try
@@ -1528,20 +1808,44 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                 return targets;
             }
 
+            var items = frame.Locator("[data-testid^=\"pbimenu-item.\"]");
+            var existingTestIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var existingCount = await items.CountAsync();
+            for (var i = 0; i < existingCount; i++)
+            {
+                var testId = await SafeAttributeAsync(items.Nth(i), "data-testid");
+                if (!string.IsNullOrWhiteSpace(testId))
+                {
+                    existingTestIds.Add(testId);
+                }
+            }
+
             // CLICK (not hover) to expand the flyout. Power BI marks the expanded parent with
             // aria-expanded="true" and renders the destination list in a SEPARATE cdk-overlay-pane as its
             // own <pbi-menu role="menu">, so the targets are not siblings of the parent in the DOM.
-            try { await drillItem.ClickAsync(new LocatorClickOptions { Timeout = 5000 }); }
+            try
+            {
+                await drillItem.ClickAsync(new LocatorClickOptions { Timeout = 5000 });
+            }
             catch { return targets; }
 
-            await page.WaitForTimeoutAsync(600);
-
-            // Read the destination entries straight off the submenu: every item is a
-            // <button data-testid="pbimenu-item.<page name>" title="<page name>">. Excluding the parent's
-            // own testid leaves exactly the destination pages, with no before/after diffing.
+            // Read only items newly introduced by expanding the submenu. The original context menu remains
+            // mounted in another overlay and contains unrelated commands such as Freeze/Unfreeze row headers;
+            // treating every pbimenu item as a destination causes false recursive navigation.
             var parentTestId = $"pbimenu-item.{options.DrillThroughMenuText}";
-            var items = frame.Locator("[data-testid^=\"pbimenu-item.\"]");
-            var count = await items.CountAsync();
+            var submenuDeadline = DateTime.UtcNow.AddSeconds(2);
+            var count = existingCount;
+            while (count <= existingCount && DateTime.UtcNow < submenuDeadline)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await page.WaitForTimeoutAsync(100);
+                count = await items.CountAsync();
+            }
+
+            if (count <= existingCount)
+            {
+                return targets;
+            }
 
             for (var i = 0; i < count; i++)
             {
@@ -1552,7 +1856,14 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
                 catch { continue; }
 
                 if (string.IsNullOrEmpty(testId) ||
+                    existingTestIds.Contains(testId) ||
                     string.Equals(testId, parentTestId, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var hasPopup = await SafeAttributeAsync(item, "aria-haspopup");
+                if (string.Equals(hasPopup, "true", StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
@@ -1591,7 +1902,12 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
     /// <paramref name="targetLabel"/>. Returns true if the destination was clicked.
     /// </summary>
     private async Task<bool> ClickDrillThroughTargetAsync(
-        IPage page, IFrameLocator frame, HeadlessCheckOptions options, string targetLabel)
+        IPage page,
+        IFrameLocator frame,
+        HeadlessCheckOptions options,
+        string targetLabel,
+        string drillPath,
+        CancellationToken cancellationToken)
     {
         try
         {
@@ -1943,7 +2259,7 @@ public sealed class HeadlessReportChecker : IHeadlessReportChecker
     /// Power BI's built-in "Back" affordance where available and otherwise ignoring failures. Best-effort:
     /// the next interaction re-checks from wherever the report lands.
     /// </summary>
-    private static async Task ReturnToBaselineAsync(IPage page)
+    private async Task ReturnToBaselineAsync(IPage page, CancellationToken cancellationToken)
     {
         try
         {

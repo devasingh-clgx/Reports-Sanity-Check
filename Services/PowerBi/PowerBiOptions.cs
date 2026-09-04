@@ -46,12 +46,6 @@ public sealed class PowerBiOptions
     public string? WorkspaceId { get; set; }
 
     /// <summary>
-    /// When true, every report in the target workspace is discovered automatically.
-    /// When false, only the reports listed in <see cref="Reports"/> are checked.
-    /// </summary>
-    public bool AutoDiscoverReports { get; set; } = true;
-
-    /// <summary>
     /// When set, auto-discovery only includes reports under this top-level workspace folder (and its
     /// nested sub-folders). Leave blank to include reports from anywhere in the workspace. Matched
     /// case-insensitively against the Fabric folder display name (e.g. "Reports"). Requires the
@@ -103,17 +97,6 @@ public sealed class PowerBiOptions
     /// </summary>
     public int InteropTimeoutBufferSeconds { get; set; } = 30;
 
-    /// <summary>When true, every bookmark in each report is applied and re-checked.</summary>
-    public bool CheckBookmarks { get; set; } = true;
-
-    /// <summary>
-    /// When true, every page in each report is activated and re-checked, including hidden pages.
-    /// Hidden pages are typically drill-through destinations, so rendering them is how the check
-    /// exercises drill-through targets (2–3 levels deep) — the embed SDK exposes no method to trigger
-    /// a drill programmatically, so visiting the destination pages directly is the supported approach.
-    /// </summary>
-    public bool CheckAllPages { get; set; } = true;
-
     /// <summary>Maximum time to wait for a page to re-render after it is activated.</summary>
     public int PageTimeoutSeconds { get; set; } = 60;
 
@@ -125,22 +108,6 @@ public sealed class PowerBiOptions
 
     /// <summary>Returns the effective per-report page cap, treating 0 as unlimited.</summary>
     public int GetMaxPagesPerReport() => MaxPagesPerReport <= 0 ? int.MaxValue : MaxPagesPerReport;
-
-    /// <summary>
-    /// When true, the runner drives a drill-through from each table/matrix visual by right-clicking its
-    /// first data row and choosing "Drill through" from the report context menu, then checks the target
-    /// page. Drill-through cannot be triggered through the embed SDK, so this is done via Playwright DOM
-    /// interaction against the report iframe and is best-effort (a target that can't be found is skipped
-    /// and logged, not failed).
-    /// </summary>
-    public bool CheckDrillThrough { get; set; } = true;
-
-    /// <summary>
-    /// When true, the runner flips toggle-style custom visuals (e.g. the BENE.BIZ Toggle Switch) between
-    /// their ON/OFF states and re-checks after each flip, so a visual that only appears in one toggle
-    /// state is still exercised. Also DOM-driven and best-effort.
-    /// </summary>
-    public bool CheckToggles { get; set; } = true;
 
     /// <summary>Time to wait after a drill-through/toggle interaction for the report to settle and re-render.</summary>
     public int InteractionSettleSeconds { get; set; } = 10;
@@ -187,9 +154,6 @@ public sealed class PowerBiOptions
     /// menu-item text can be inspected to understand how the current Fabric/Power BI renders drill-through.
     /// </summary>
     public bool DebugDrillThroughDom { get; set; }
-
-    /// <summary>Explicit list of reports to check
-    public List<PowerBiReportConfig> Reports { get; set; } = new();
 
     /// <summary>
     /// Row-level-security identity to impersonate when generating embed tokens. Required when the

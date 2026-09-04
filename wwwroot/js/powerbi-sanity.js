@@ -110,65 +110,6 @@ export async function getActivePageInfoForInteraction() {
     return JSON.stringify(info);
 }
 
-// OPENS A DRILL-THROUGH DESTINATION PAGE DIRECTLY.
-//
-// The native right-click gesture requires a rendered data cell to click on. When no such cell is
-// available the destination page can still be opened deterministically: activate the hidden page and
-// apply the drill-through field(s) as page-level filter context, which is exactly what Power BI does
-// internally when a user picks a destination from the Drill through submenu.
-//
-// `filters` is an array of { table, column, value }. When empty the page is opened with no filter
-// context, which still verifies the page renders (reported as 'partial').
-//
-// Returns JSON: { opened, filtersApplied, page, error }.
-export async function openDrillThroughPageForInteraction(pageName, filters, settleMs) {
-    const outcome = { opened: false, filtersApplied: false, page: pageName, error: null };
-    try {
-        if (!__interactionState.report || !pageName) {
-            outcome.error = 'No report or page name.';
-            return JSON.stringify(outcome);
-        }
-
-        const pages = await __interactionState.report.getPages();
-        const target = Array.isArray(pages) ? pages.find(p => p.name === pageName) : null;
-        if (!target) {
-            outcome.error = 'Page not found.';
-            return JSON.stringify(outcome);
-        }
-
-        await target.setActive();
-        await waitForRenderOrSettle(__interactionState.report, Math.max(250, Math.min(settleMs || 2500, 60000)));
-        outcome.opened = true;
-
-        const list = Array.isArray(filters) ? filters : [];
-        if (list.length > 0) {
-            const basicFilters = list
-                .filter(f => f && f.table && f.column)
-                .map(f => ({
-                    $schema: 'http://powerbi.com/product/schema#basic',
-                    target: { table: f.table, column: f.column },
-                    operator: 'In',
-                    values: [f.value],
-                    filterType: 1 // models.FilterType.Basic
-                }));
-
-            if (basicFilters.length > 0) {
-                try {
-                    // Replace rather than add so repeated opens don't stack filter context.
-                    await target.updateFilters(0 /* models.FiltersOperations.Replace */, basicFilters);
-                    await waitForRenderOrSettle(__interactionState.report, Math.max(250, Math.min(settleMs || 2500, 60000)));
-                    outcome.filtersApplied = true;
-                } catch (ex) {
-                    outcome.error = 'Filter apply failed: ' + ex.message;
-                }
-            }
-        }
-    } catch (ex) {
-        outcome.error = ex.message;
-    }
-    return JSON.stringify(outcome);
-}
-
 // Returns the report's VISIBLE (directly navigable) pages as a JSON string of {name, displayName}.
 // Hidden pages are drill-through destinations and are deliberately excluded: the drill-through pass
 // reaches them through an actual drill-through action. Used by the runner to iterate every visible
@@ -207,8 +148,10 @@ export async function setActivePageForInteraction(name, settleMs) {
         if (!page) {
             return false;
         }
-        await page.setActive();
-        await waitForRenderOrSettle(__interactionState.report, Math.max(250, Math.min(settleMs || 2500, 60000)));
+        await performAndWaitForRenderOrSettle(
+            __interactionState.report,
+            Math.max(250, Math.min(settleMs || 2500, 60000)),
+            () => page.setActive());
         return true;
     } catch {
         return false;
@@ -226,7 +169,8 @@ export async function getApplyableBookmarksForInteraction() {
             return '[]';
         }
         let bookmarks = await __interactionState.report.bookmarksManager.getBookmarks();
-        bookmarks = flattenBookmarks(bookmarks);
+        bookmarks = flattenBookmarks(bookmarks)
+            .filter(b => !isParameterDependentDrillThroughBookmark(b));
         const mapped = bookmarks.map(b => ({ name: b.name, displayName: b.displayName ?? b.name }));
         return JSON.stringify(mapped);
     } catch {
@@ -242,8 +186,10 @@ export async function applyBookmarkForInteraction(name, settleMs) {
         if (!__interactionState.report || !name) {
             return false;
         }
-        await __interactionState.report.bookmarksManager.apply(name);
-        await waitForRenderOrSettle(__interactionState.report, Math.max(250, Math.min(settleMs || 2500, 60000)));
+        await performAndWaitForRenderOrSettle(
+            __interactionState.report,
+            Math.max(250, Math.min(settleMs || 2500, 60000)),
+            () => __interactionState.report.bookmarksManager.apply(name));
         return true;
     } catch {
         return false;
@@ -685,6 +631,15 @@ function flattenBookmarks(bookmarks) {
     return leaves;
 }
 
+// Some reports contain a leaf bookmark named "Drill-through" that represents the destination's
+// parameterized template state. Applying it directly omits Power BI's incoming drill-through context and
+// produces false Missing_References/Broken_Filters errors. Native right-click traversal is the only valid
+// way to verify that state, so exclude only this exact normalized placeholder name when interactions run.
+function isParameterDependentDrillThroughBookmark(bookmark) {
+    const label = bookmark?.displayName ?? bookmark?.name ?? '';
+    return label.toLowerCase().replace(/[^a-z0-9]+/g, '') === 'drillthrough';
+}
+
 async function checkBookmarks(report, options, errors, errorSink) {
     const results = [];
 
@@ -719,6 +674,20 @@ async function checkBookmarks(report, options, errors, errorSink) {
     for (const bookmark of bookmarks) {
         const displayName = bookmark.displayName ?? bookmark.name;
 
+        if (options.runInteractions && isParameterDependentDrillThroughBookmark(bookmark)) {
+            results.push({
+                name: bookmark.name,
+                displayName: displayName,
+                page: null,
+                status: STATUS.Pending,
+                skipped: true,
+                errorCount: 0,
+                durationMs: 0,
+                message: 'Skipped direct apply: parameter-dependent drill-through bookmark is verified through native right-click traversal.'
+            });
+            continue;
+        }
+
         // Stop applying bookmarks once the overall time budget is spent so a slow report still
         // returns a measured result instead of being cancelled by the .NET interop timeout.
         if (typeof options.deadline === 'number' && performance.now() >= options.deadline) {
@@ -752,9 +721,12 @@ async function checkBookmarks(report, options, errors, errorSink) {
         // of the bookmark itself (the report-level duration remains the total across all bookmarks).
         const bookmarkStarted = performance.now();
         try {
-            await report.bookmarksManager.apply(bookmark.name);
-            // Wait for a re-render if one comes; a no-op bookmark simply settles without rendering.
-            await waitForRenderOrSettle(report, settleMs);
+            // Arm the listener before applying the bookmark so a fast render cannot be missed.
+            // A no-op bookmark still resolves through the bounded settle fallback.
+            await performAndWaitForRenderOrSettle(
+                report,
+                settleMs,
+                () => report.bookmarksManager.apply(bookmark.name));
             // Record which page the bookmark actually landed on (helps explain cross-page bookmarks).
             page = await getActivePageName(report);
         } catch (ex) {
@@ -799,8 +771,10 @@ async function restoreBaseline(report, baselineState, errorSink, settleMs) {
     const previousSink = errorSink.current;
     errorSink.current = [];
     try {
-        await report.bookmarksManager.applyState(baselineState);
-        await waitForRenderOrSettle(report, settleMs);
+        await performAndWaitForRenderOrSettle(
+            report,
+            settleMs,
+            () => report.bookmarksManager.applyState(baselineState));
     } catch {
         // A failed restore isn't a bookmark failure; ignore and continue.
     } finally {
@@ -824,6 +798,14 @@ function waitForRenderOrSettle(report, settleMs) {
         const timer = setTimeout(finish, settleMs);
         report.on('rendered', onRendered);
     });
+}
+
+// Arms the rendered listener before starting an SDK operation. Registering it after `apply` or
+// `setActive` races with fast renders and makes successful operations pay the full settle timeout.
+async function performAndWaitForRenderOrSettle(report, settleMs, operation) {
+    const rendered = waitForRenderOrSettle(report, settleMs);
+    await operation();
+    await rendered;
 }
 
 // Returns the active page's display name, or null if it can't be determined.
@@ -921,9 +903,8 @@ async function checkPages(report, options, errors, errorSink) {
 
         const pageStarted = performance.now();
         try {
-            await page.setActive();
-            // Wait for a re-render if one comes; a page that's already active simply settles.
-            await waitForRenderOrSettle(report, settleMs);
+            // Arm the listener before activating the page so fast renders are observed.
+            await performAndWaitForRenderOrSettle(report, settleMs, () => page.setActive());
 
             // Count visuals so the result confirms the page actually drew something (and so drill-through
             // destination visuals are represented even when they don't error).
@@ -1100,7 +1081,7 @@ export async function checkReport(containerId, embed, options) {
     // The report itself is healthy if it rendered and produced no report-level errors. A bookmark or
     // page that fails is reported against that bookmark/page and flagged here, but it no longer fails
     // the whole report on its own unless it produced a report-level error.
-    const bookmarkFailures = bookmarks.filter(b => b.status !== STATUS.Passed).length;
+    const bookmarkFailures = bookmarks.filter(b => !b.skipped && b.status !== STATUS.Passed).length;
     const pageFailures = pageResults.filter(p => p.status !== STATUS.Passed).length;
     let status;
     let message;

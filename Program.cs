@@ -33,21 +33,6 @@ builder.Services.AddScoped<IEmailNotificationService, SendGridEmailNotificationS
 
 var app = builder.Build();
 
-// Headless browser bootstrap. The Microsoft.Playwright package ships automation code but not the
-// Chromium binaries, so hosts that don't use the Playwright container image must download them.
-// Point the cache at a persisted folder so it survives restarts, then optionally install at startup.
-// Both are opt-in via "Headless:InstallBrowserOnStartup" so the Linux Playwright image and local dev
-// (where Chromium is already present) skip the download.
-{
-    var startupLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("PlaywrightInstaller");
-    PlaywrightInstaller.ConfigureBrowsersPath(app.Configuration, app.Environment, startupLogger);
-
-    if (app.Configuration.GetValue("Headless:InstallBrowserOnStartup", false))
-    {
-        PlaywrightInstaller.EnsureChromiumInstalled(startupLogger);
-    }
-}
-
 // Serve the static headless host page (wwwroot/headless-check.html) plus its powerbi client/module
 // so the in-process Chromium can load them from the app's own loopback origin during the run.
 app.UseStaticFiles();

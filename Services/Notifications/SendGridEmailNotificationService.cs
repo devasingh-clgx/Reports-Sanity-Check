@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text;
 using Microsoft.Extensions.Options;
+using Reports_Sanity_Check.Services.PowerBi;
 using Reports_Sanity_Check.Services.PowerBi.Models;
 using SendGrid;
 using SendGrid.Helpers.Mail;
@@ -25,25 +26,6 @@ public interface IEmailNotificationService
         SanityCheckRun run,
         IReadOnlyList<string>? recipientsOverride = null,
         CancellationToken cancellationToken = default);
-
-    /// <summary>
-    /// Sends an operational alert to the configured admin recipients when the job <em>workflow</em>
-    /// itself fails (e.g. bad pipeline input, auth/discovery error, headless browser failure, or a
-    /// persistence failure) — the conditions that would otherwise be invisible because Log Analytics
-    /// is disabled for the Container Apps Job. This is distinct from a Power BI report breaking,
-    /// which is reported through <see cref="SendRunSummaryAsync"/>. Never throws into the caller.
-    /// </summary>
-    /// <param name="stage">The workflow stage that failed (e.g. "Input validation", "Report discovery").</param>
-    /// <param name="error">The exception or error detail that caused the failure.</param>
-    /// <param name="context">
-    /// Optional diagnostic key/value pairs (e.g. the raw WorkspaceId/Environment/ToEmails inputs) shown
-    /// in the alert with whitespace made visible so hidden characters like <c>\n</c> are obvious.
-    /// </param>
-    Task SendJobFailureAsync(
-        string stage,
-        string error,
-        IReadOnlyDictionary<string, string?>? context = null,
-        CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -58,13 +40,16 @@ public sealed class SendGridEmailNotificationService : IEmailNotificationService
     private const long HighPltThresholdMs = 60_000;
 
     private readonly EmailOptions _options;
+    private readonly PowerBiOptions _powerBiOptions;
     private readonly ILogger<SendGridEmailNotificationService> _logger;
 
     public SendGridEmailNotificationService(
         IOptions<EmailOptions> options,
+        IOptions<PowerBiOptions> powerBiOptions,
         ILogger<SendGridEmailNotificationService> logger)
     {
         _options = options.Value;
+        _powerBiOptions = powerBiOptions.Value;
         _logger = logger;
     }
 
@@ -90,13 +75,6 @@ public sealed class SendGridEmailNotificationService : IEmailNotificationService
             _logger.LogInformation(
                 "Email notifications are not configured (missing SendGrid API key, sender, or recipients); skipping run {RunId}.",
                 run.RunId);
-            return;
-        }
-
-        if (_options.SendOnlyOnFailure && !run.HasFailures)
-        {
-            _logger.LogInformation(
-                "Run {RunId} passed and SendOnlyOnFailure is enabled; skipping email.", run.RunId);
             return;
         }
 
@@ -137,68 +115,6 @@ public sealed class SendGridEmailNotificationService : IEmailNotificationService
         {
             // Never let a notification failure bubble up and fail the run.
             _logger.LogError(ex, "Failed to send the sanity run {RunId} summary email.", run.RunId);
-        }
-    }
-
-    public async Task SendJobFailureAsync(
-        string stage,
-        string error,
-        IReadOnlyDictionary<string, string?>? context = null,
-        CancellationToken cancellationToken = default)
-    {
-        var recipients = _options.GetAdminRecipients();
-
-        var canSend =
-            !string.IsNullOrWhiteSpace(_options.ApiKey)
-            && !string.IsNullOrWhiteSpace(_options.FromEmail)
-            && recipients.Count > 0;
-
-        if (!canSend)
-        {
-            // Log at Error so the failure is still visible in container stdout even when email is off.
-            _logger.LogError(
-                "Job workflow failed at stage '{Stage}' but email is not configured to alert admins: {Error}",
-                stage, error);
-            return;
-        }
-
-        try
-        {
-            var client = new SendGridClient(_options.ApiKey);
-
-            var message = new SendGridMessage
-            {
-                From = new EmailAddress(_options.FromEmail, _options.FromName),
-                Subject = $"\u274C Report Sanity Check JOB FAILED - {stage}",
-                HtmlContent = BuildJobFailureHtmlBody(stage, error, context),
-                PlainTextContent = BuildJobFailurePlainTextBody(stage, error, context)
-            };
-
-            foreach (var address in recipients)
-            {
-                message.AddTo(new EmailAddress(address));
-            }
-
-            var response = await client.SendEmailAsync(message, cancellationToken);
-
-            if (IsSuccess(response.StatusCode))
-            {
-                _logger.LogInformation(
-                    "Sent job failure alert (stage '{Stage}') to {Recipients} (status {Status}).",
-                    stage, string.Join(", ", recipients), (int)response.StatusCode);
-            }
-            else
-            {
-                var body = await response.Body.ReadAsStringAsync(cancellationToken);
-                _logger.LogError(
-                    "SendGrid rejected the job failure alert (stage '{Stage}'): {Status} {Body}",
-                    stage, (int)response.StatusCode, body);
-            }
-        }
-        catch (Exception ex)
-        {
-            // Never let the alert itself throw; the caller is already handling a failure.
-            _logger.LogError(ex, "Failed to send the job failure alert for stage '{Stage}'.", stage);
         }
     }
 
@@ -263,12 +179,59 @@ public sealed class SendGridEmailNotificationService : IEmailNotificationService
 
         sb.Append("</tbody></table>");
 
-        AppendDrillThroughDiagnostics(sb, run);
+        if (!string.IsNullOrWhiteSpace(_powerBiOptions.DebugReportName))
+        {
+            AppendPerformanceDiagnostics(sb, run);
+        }
 
         sb.Append("<p style=\"margin-top:16px;color:#adb5bd;font-size:12px;\">Sent automatically by Reports Sanity Check.</p>");
         sb.Append("</div>");
 
         return sb.ToString();
+    }
+
+    private static void AppendPerformanceDiagnostics(StringBuilder sb, SanityCheckRun run)
+    {
+        sb.Append("<h3 style=\"margin-top:24px;font-size:15px;color:#212529;\">Debug performance diagnostics</h3>");
+        foreach (var result in run.Results)
+        {
+            var performance = result.Performance;
+            sb.Append($"<p style=\"margin:10px 0 2px;font-weight:600;font-size:13px;\">{Encode(result.ReportName)}</p>");
+            sb.Append($"<p style=\"margin:0 0 4px;color:#6c757d;font-size:12px;\">Page lifetime: {FormatMilliseconds(performance.PageLifetimeMs)}; context age: {FormatMilliseconds(performance.ContextAgeAtStartMs)} → {FormatMilliseconds(performance.ContextAgeAtEndMs)}; peak browser working set: {FormatMegabytes(performance.PeakBrowserWorkingSetBytes)}; peak JS heap: {FormatMegabytes(performance.PeakJavaScriptHeapUsedBytes)}.</p>");
+
+            if (performance.Phases.Count > 0)
+            {
+                sb.Append("<table style=\"border-collapse:collapse;font-size:12px;margin-bottom:8px;border:1px solid #dee2e6;\"><thead><tr style=\"background:#f1f3f5;text-align:left;\">");
+                AppendHeaderCell(sb, "Phase");
+                AppendHeaderCell(sb, "Duration");
+                AppendHeaderCell(sb, "Count");
+                AppendHeaderCell(sb, "Scope");
+                sb.Append("</tr></thead><tbody>");
+                foreach (var phase in performance.Phases)
+                {
+                    sb.Append("<tr style=\"border-bottom:1px solid #e9ecef;\">");
+                    sb.Append($"<td style=\"padding:2px 6px;\">{Encode(phase.Name)}</td>");
+                    sb.Append($"<td style=\"padding:2px 6px;\">{Encode(FormatMilliseconds(phase.DurationMs))}</td>");
+                    sb.Append($"<td style=\"padding:2px 6px;\">{phase.Count}</td>");
+                    sb.Append($"<td style=\"padding:2px 6px;\">{Encode(phase.Scope ?? "—")}</td></tr>");
+                }
+                sb.Append("</tbody></table>");
+            }
+
+            if (performance.ResourceSamples.Count > 0)
+            {
+                sb.Append("<p style=\"margin:2px 0 8px;color:#6c757d;font-size:12px;\">Resource samples: ");
+                sb.Append(string.Join(" | ", performance.ResourceSamples.Select(sample =>
+                    $"{Encode(sample.Phase)} @ {Encode(FormatMilliseconds(sample.ElapsedMs))}: browser {Encode(FormatMegabytes(sample.BrowserWorkingSetBytes))}, JS {Encode(FormatMegabytes(sample.JavaScriptHeapUsedBytes))}, processes {sample.BrowserProcessCount}")));
+                sb.Append("</p>");
+            }
+
+            foreach (var note in result.DrillThrough.Notes.Where(note =>
+                         note.StartsWith("PBIR page classification:", StringComparison.Ordinal)))
+            {
+                sb.Append($"<p style=\"margin:4px 0;color:#6c757d;font-size:12px;\">{Encode(note)}</p>");
+            }
+        }
     }
 
     /// <summary>
@@ -295,7 +258,7 @@ public sealed class SendGridEmailNotificationService : IEmailNotificationService
         }
 
         sb.Append("<h3 style=\"margin-top:24px;font-size:15px;color:#212529;\">Drill-through map</h3>");
-        sb.Append("<p style=\"margin:4px 0;color:#6c757d;font-size:12px;\">Drill-through targets are read from each report's definition metadata (workspace-member access), then each destination page is opened in reading mode with its bound field(s) as filter context. \u2713 = rendered without visual errors; \u2717 = rendered with errors; \u26A0 = opened but drill-through filter context not applied (partial); \u2014 = declared but not verified.</p>");
+        sb.Append("<p style=\"margin:4px 0;color:#6c757d;font-size:12px;\">Drill-through targets are read from each report's definition metadata for coverage, but a destination is verified only when it is exposed and opened through Power BI's native right-click drill-through menu. Metadata-only destinations are not opened directly because parameter-dependent pages can fail without their real interaction context. \u2713 = native path rendered without visual errors; \u2717 = native path rendered with errors; \u2014 = declared but not reached natively.</p>");
 
         foreach (var result in reportsWithDrill)
         {
@@ -336,7 +299,6 @@ public sealed class SendGridEmailNotificationService : IEmailNotificationService
                     var methodBadge = target.VerificationMethod switch
                     {
                         DrillThroughVerificationMethod.RealGesture => " <span style=\"color:#2b8a3e;font-size:11px;\">(right-click gesture)</span>",
-                        DrillThroughVerificationMethod.MetadataFallback => " <span style=\"color:#e8590c;font-size:11px;\">(metadata fallback)</span>",
                         _ => string.Empty
                     };
                     sb.Append($"<li><span style=\"color:{markColor};font-weight:600;\">{mark}</span> {Encode(pageLabel)} <span style=\"color:#868e96;\">[{Encode(target.FieldSummary)}]</span>{methodBadge}");
@@ -471,6 +433,16 @@ public sealed class SendGridEmailNotificationService : IEmailNotificationService
                 Targets = g.SelectMany(x => x.Targets).Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
                 Fields = g.Where(x => !string.IsNullOrWhiteSpace(x.FieldRef))
                           .Select(x => x.FieldRef!).Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
+                ClickedData = g.SelectMany(x => x.ClickedData)
+                    .Select(cell => $"{cell.Column}={cell.Value}")
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Take(12)
+                    .ToList(),
+                SourceRows = g.SelectMany(x => x.SourceRow)
+                    .Select(cell => $"{cell.Column}={cell.Value}")
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Take(12)
+                    .ToList(),
                 MenuItems = g.SelectMany(x => x.MenuItems).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
             })
             .OrderByDescending(x => x.HasDrill)
@@ -489,6 +461,7 @@ public sealed class SendGridEmailNotificationService : IEmailNotificationService
         sb.Append("<th style=\"text-align:left;padding:3px 8px;border:1px solid #dee2e6;\">Page</th>");
         sb.Append("<th style=\"text-align:left;padding:3px 8px;border:1px solid #dee2e6;\">Visual</th>");
         sb.Append("<th style=\"text-align:left;padding:3px 8px;border:1px solid #dee2e6;\">Element</th>");
+        sb.Append("<th style=\"text-align:left;padding:3px 8px;border:1px solid #dee2e6;\">Right-click data</th>");
         sb.Append("<th style=\"text-align:left;padding:3px 8px;border:1px solid #dee2e6;\">Drill through?</th>");
         sb.Append("<th style=\"text-align:left;padding:3px 8px;border:1px solid #dee2e6;\">Destination pages</th>");
         sb.Append("</tr>");
@@ -497,11 +470,17 @@ public sealed class SendGridEmailNotificationService : IEmailNotificationService
         {
             var (mark, markColor) = v.HasDrill ? ("\u2713 yes", "#2f9e44") : ("\u2014 no", "#adb5bd");
             var targets = v.Targets.Count > 0 ? string.Join(", ", v.Targets) : "\u2014";
+            var clickedData = v.ClickedData.Count > 0
+                ? string.Join(", ", v.ClickedData)
+                : v.SourceRows.Count > 0
+                    ? "exported row: " + string.Join(", ", v.SourceRows)
+                    : "\u2014";
 
             sb.Append("<tr>");
             sb.Append($"<td style=\"padding:3px 8px;border:1px solid #dee2e6;\">{Encode(v.Page)}</td>");
             sb.Append($"<td style=\"padding:3px 8px;border:1px solid #dee2e6;\">{Encode(v.Visual)}</td>");
             sb.Append($"<td style=\"padding:3px 8px;border:1px solid #dee2e6;\">{Encode(v.ElementKind)}</td>");
+            sb.Append($"<td style=\"padding:3px 8px;border:1px solid #dee2e6;\">{Encode(clickedData)}</td>");
             sb.Append($"<td style=\"padding:3px 8px;border:1px solid #dee2e6;color:{markColor};font-weight:600;\">{mark}</td>");
             sb.Append($"<td style=\"padding:3px 8px;border:1px solid #dee2e6;\">{Encode(targets)}</td>");
             sb.Append("</tr>");
@@ -511,7 +490,7 @@ public sealed class SendGridEmailNotificationService : IEmailNotificationService
             // a drill-through.
             if (!v.HasDrill && v.MenuItems.Count > 0)
             {
-                sb.Append("<tr><td colspan=\"5\" style=\"padding:2px 8px 6px 20px;border:1px solid #dee2e6;color:#868e96;font-size:11px;\">");
+                sb.Append("<tr><td colspan=\"6\" style=\"padding:2px 8px 6px 20px;border:1px solid #dee2e6;color:#868e96;font-size:11px;\">");
                 sb.Append($"Menu seen: {Encode(string.Join(" | ", v.MenuItems))}");
                 if (v.Fields.Count > 0)
                 {
@@ -622,63 +601,33 @@ public sealed class SendGridEmailNotificationService : IEmailNotificationService
                 $"- {result.ReportName}: {result.Status} | slowest load {FormatSeconds(result.MaxBookmarkDurationMs)}{highPlt} | {BuildDetail(result)}");
         }
 
-        // Drill-through map (plain text): list each report's declared drill-through targets and status.
-        var reportsWithDrill = run.Results
-            .Where(r => r.DrillThrough.DeclaredTargets.Count > 0
-                        || r.DrillThrough.Probes.Count > 0)
-            .ToList();
-        if (reportsWithDrill.Count > 0)
+        if (!string.IsNullOrWhiteSpace(_powerBiOptions.DebugReportName))
         {
             sb.AppendLine();
-            sb.AppendLine("Drill-through map [x = verified OK, ! = errors, blank = not verified]:");
-            foreach (var result in reportsWithDrill)
+            sb.AppendLine("Debug performance diagnostics:");
+            foreach (var result in run.Results)
             {
-                var d = result.DrillThrough;
-                sb.AppendLine($"  {result.ReportName}:");
-
-                if (d.DeclaredTargets.Count == 0)
+                var performance = result.Performance;
+                sb.AppendLine($"  {result.ReportName}: page lifetime {FormatMilliseconds(performance.PageLifetimeMs)}; context age {FormatMilliseconds(performance.ContextAgeAtStartMs)} -> {FormatMilliseconds(performance.ContextAgeAtEndMs)}; peak browser {FormatMegabytes(performance.PeakBrowserWorkingSetBytes)}; peak JS heap {FormatMegabytes(performance.PeakJavaScriptHeapUsedBytes)}");
+                foreach (var phase in performance.Phases)
                 {
-                    sb.AppendLine("    No drill-through targets are declared in this report's metadata.");
+                    sb.AppendLine($"    {phase.Name}: {FormatMilliseconds(phase.DurationMs)}; count {phase.Count}; scope {phase.Scope ?? "—"}");
                 }
-                else
+                foreach (var sample in performance.ResourceSamples)
                 {
-                    var verified = d.DeclaredTargets.Count(t => t.Status == SanityStatus.Passed);
-                    var failed = d.DeclaredTargets.Count(t => t.Status == SanityStatus.Failed);
-                    var skipped = d.DeclaredTargets.Count(t => t.Status is not SanityStatus.Passed and not SanityStatus.Failed);
-                    sb.AppendLine($"    Declared targets: {d.DeclaredTargets.Count}; {verified} verified OK, {failed} with errors, {skipped} not verified{(d.CapReached ? " [CAP REACHED]" : string.Empty)}");
-
-                    foreach (var target in d.DeclaredTargets)
-                    {
-                        var mark = target.Status switch
-                        {
-                            SanityStatus.Passed => "[x]",
-                            SanityStatus.Failed => "[!]",
-                            _ => "[ ]"
-                        };
-                        var pageLabel = string.IsNullOrWhiteSpace(target.PageDisplayName) ? target.PageName : target.PageDisplayName;
-                        var methodBadge = target.VerificationMethod switch
-                        {
-                            DrillThroughVerificationMethod.RealGesture => " (right-click gesture)",
-                            DrillThroughVerificationMethod.MetadataFallback => " (metadata fallback)",
-                            _ => string.Empty
-                        };
-                        sb.AppendLine($"    {mark} {pageLabel} [{target.FieldSummary}]{methodBadge}");
-                        if (!string.IsNullOrWhiteSpace(target.Message))
-                        {
-                            sb.AppendLine($"        {target.Message}");
-                        }
-                    }
-                }
-
-                foreach (var note in d.Notes)
-                {
-                    sb.AppendLine($"    Note: {note}");
+                    sb.AppendLine($"    Resource {sample.Phase} @ {FormatMilliseconds(sample.ElapsedMs)}: browser {FormatMegabytes(sample.BrowserWorkingSetBytes)}; JS {FormatMegabytes(sample.JavaScriptHeapUsedBytes)}; processes {sample.BrowserProcessCount}");
                 }
             }
         }
 
         return sb.ToString();
     }
+
+    private static string FormatMilliseconds(long milliseconds) =>
+        milliseconds >= 1000 ? $"{milliseconds / 1000d:0.###} s" : $"{milliseconds} ms";
+
+    private static string FormatMegabytes(long bytes) =>
+        bytes <= 0 ? "n/a" : $"{bytes / 1024d / 1024d:0.0} MB";
 
     /// <summary>The friendly workspace name when available, else the workspace id, else a placeholder.</summary>
     private static string WorkspaceLabel(SanityCheckRun run) =>
@@ -808,8 +757,61 @@ public sealed class SendGridEmailNotificationService : IEmailNotificationService
             okParts.Add($"{okInteractions} interaction(s) OK");
         }
 
-        return okParts.Count > 0 ? [string.Join(", ", okParts)] : ["Rendered OK"];
+        var detailSegments = new List<string>
+        {
+            okParts.Count > 0 ? string.Join(", ", okParts) : "Rendered OK"
+        };
+
+        var drillThroughTargets = result.DrillThrough.DeclaredTargets
+            .Where(target => target.Fields.Count > 0)
+            .ToList();
+        AddDrillThroughStatusSegment(detailSegments, drillThroughTargets, SanityStatus.Passed, "passed");
+        AddDrillThroughStatusSegment(detailSegments, drillThroughTargets, SanityStatus.Failed, "failed");
+
+        var unverified = drillThroughTargets
+            .Where(target => target.Status is not SanityStatus.Passed and not SanityStatus.Failed)
+            .Select(DrillThroughPageLabel)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (unverified.Count > 0)
+        {
+            detailSegments.Add($"Drill-through unverified: {string.Join(", ", unverified)}");
+        }
+
+        var unconfiguredCandidates = result.DrillThrough.DeclaredTargets
+            .Where(target => target.Fields.Count == 0 && target.Status == SanityStatus.Pending)
+            .Select(DrillThroughPageLabel)
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (unconfiguredCandidates.Count > 0)
+        {
+            detailSegments.Add(
+                $"Hidden drill-through candidate unverified (no bound field): {string.Join(", ", unconfiguredCandidates)}");
+        }
+
+        return detailSegments;
     }
+
+    private static void AddDrillThroughStatusSegment(
+        List<string> segments,
+        IReadOnlyList<DrillThroughTarget> targets,
+        SanityStatus status,
+        string statusLabel)
+    {
+        var names = targets
+            .Where(target => target.Status == status)
+            .Select(DrillThroughPageLabel)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (names.Count > 0)
+        {
+            segments.Add($"Drill-through {statusLabel}: {string.Join(", ", names)}");
+        }
+    }
+
+    private static string DrillThroughPageLabel(DrillThroughTarget target) =>
+        string.IsNullOrWhiteSpace(target.PageDisplayName) ? target.PageName : target.PageDisplayName;
 
     /// <summary>Joins the detail segments into a single line for plain-text output.</summary>
     private static string BuildDetail(ReportSanityResult result) =>
@@ -890,108 +892,6 @@ public sealed class SendGridEmailNotificationService : IEmailNotificationService
 
     private static string FormatSeconds(long durationMs) =>
         durationMs <= 0 ? "\u2014" : $"{durationMs / 1000.0:0.0} s";
-
-    private string BuildJobFailureHtmlBody(
-        string stage,
-        string error,
-        IReadOnlyDictionary<string, string?>? context)
-    {
-        var sb = new StringBuilder();
-        sb.Append("<div style=\"font-family:Segoe UI,Arial,sans-serif;color:#212529;\">");
-        sb.Append("<h2 style=\"color:#b3261e;margin-bottom:4px;\">Report Sanity Check job FAILED</h2>");
-        sb.Append("<p style=\"margin-top:0;color:#6c757d;\">The Container Apps Job workflow could not complete. "
-            + "This is a job/infrastructure failure, not a Power BI report breaking.</p>");
-
-        sb.Append("<table style=\"border-collapse:collapse;font-size:14px;margin-top:8px;\">");
-        AppendHeaderRow(sb, "Failed stage", stage, "#b3261e");
-        AppendHeaderRow(sb, "Time (UTC)", $"{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss}", "#212529");
-        AppendHeaderRow(sb, "Machine", Environment.MachineName, "#212529");
-        sb.Append("</table>");
-
-        sb.Append("<h3 style=\"margin-bottom:4px;\">Error detail</h3>");
-        sb.Append($"<pre style=\"background:#f8f9fa;border:1px solid #e9ecef;padding:8px;white-space:pre-wrap;"
-            + $"word-break:break-word;font-size:12px;\">{Encode(error)}</pre>");
-
-        if (context is { Count: > 0 })
-        {
-            sb.Append("<h3 style=\"margin-bottom:4px;\">Input diagnostics</h3>");
-            sb.Append("<p style=\"margin-top:0;color:#6c757d;font-size:12px;\">Hidden whitespace is shown with "
-                + "visible markers (e.g. <code>\\n</code>, <code>\\r</code>, <code>\\t</code>) to reveal characters "
-                + "that break JSON-derived inputs.</p>");
-            sb.Append("<table style=\"border-collapse:collapse;font-size:14px;\">");
-            foreach (var (key, value) in context)
-            {
-                AppendHeaderRow(sb, key, VisualizeWhitespace(value), "#212529");
-            }
-            sb.Append("</table>");
-        }
-
-        sb.Append("<p style=\"margin-top:16px;color:#adb5bd;font-size:12px;\">Sent automatically by Reports Sanity Check.</p>");
-        sb.Append("</div>");
-
-        return sb.ToString();
-    }
-
-    private static string BuildJobFailurePlainTextBody(
-        string stage,
-        string error,
-        IReadOnlyDictionary<string, string?>? context)
-    {
-        var sb = new StringBuilder();
-        sb.AppendLine("Report Sanity Check job FAILED.");
-        sb.AppendLine("This is a job/infrastructure failure, not a Power BI report breaking.");
-        sb.AppendLine();
-        sb.AppendLine($"Failed stage: {stage}");
-        sb.AppendLine($"Time (UTC): {DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss}");
-        sb.AppendLine($"Machine: {Environment.MachineName}");
-        sb.AppendLine();
-        sb.AppendLine("Error detail:");
-        sb.AppendLine(error);
-
-        if (context is { Count: > 0 })
-        {
-            sb.AppendLine();
-            sb.AppendLine("Input diagnostics (hidden whitespace shown as \\n, \\r, \\t):");
-            foreach (var (key, value) in context)
-            {
-                sb.AppendLine($"- {key}: {VisualizeWhitespace(value)}");
-            }
-        }
-
-        return sb.ToString();
-    }
-
-    /// <summary>
-    /// Renders a value with normally-invisible control characters made visible so hidden
-    /// <c>\n</c>/<c>\r</c>/<c>\t</c> (the class of bug that previously caused opaque JSON-input
-    /// failures) is obvious in an alert. Returns a placeholder for null/empty values.
-    /// </summary>
-    private static string VisualizeWhitespace(string? value)
-    {
-        if (value is null)
-        {
-            return "(null)";
-        }
-
-        if (value.Length == 0)
-        {
-            return "(empty)";
-        }
-
-        var sb = new StringBuilder(value.Length + 8);
-        foreach (var ch in value)
-        {
-            sb.Append(ch switch
-            {
-                '\n' => "\\n",
-                '\r' => "\\r",
-                '\t' => "\\t",
-                _ => ch.ToString()
-            });
-        }
-
-        return sb.ToString();
-    }
 
     private static string Encode(string? value) => WebUtility.HtmlEncode(value ?? string.Empty);
 }

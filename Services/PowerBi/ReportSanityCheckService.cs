@@ -33,23 +33,11 @@ public interface IReportSanityCheckService
     /// <summary>Buffer added to the overall budget for the .NET JS-interop timeout.</summary>
     int InteropTimeoutBufferSeconds { get; }
 
-    /// <summary>Whether bookmarks should be applied and re-checked for each report.</summary>
-    bool CheckBookmarks { get; }
-
-    /// <summary>Whether every page (including hidden drill-through pages) should be rendered and checked.</summary>
-    bool CheckAllPages { get; }
-
     /// <summary>Maximum time to wait for a page to re-render after it is activated.</summary>
     int PageTimeoutSeconds { get; }
 
     /// <summary>Resolved upper bound on pages rendered per report (int.MaxValue = unlimited).</summary>
     int GetMaxPagesPerReport();
-
-    /// <summary>Whether table/matrix drill-through should be driven via DOM interaction.</summary>
-    bool CheckDrillThrough { get; }
-
-    /// <summary>Whether toggle-style custom visuals (e.g. BENE.BIZ Toggle Switch) should be flipped and re-checked.</summary>
-    bool CheckToggles { get; }
 
     /// <summary>Time to wait after an interaction for the report to settle/re-render.</summary>
     int InteractionSettleSeconds { get; }
@@ -119,17 +107,9 @@ public sealed class ReportSanityCheckService : IReportSanityCheckService
 
     public int InteropTimeoutBufferSeconds => _options.InteropTimeoutBufferSeconds;
 
-    public bool CheckBookmarks => _options.CheckBookmarks;
-
-    public bool CheckAllPages => _options.CheckAllPages;
-
     public int PageTimeoutSeconds => _options.PageTimeoutSeconds;
 
     public int GetMaxPagesPerReport() => _options.GetMaxPagesPerReport();
-
-    public bool CheckDrillThrough => _options.CheckDrillThrough;
-
-    public bool CheckToggles => _options.CheckToggles;
 
     public int InteractionSettleSeconds => _options.InteractionSettleSeconds;
 
@@ -197,24 +177,46 @@ public sealed class ReportSanityCheckService : IReportSanityCheckService
             {
                 var embed = await _embedService.GetEmbedConfigAsync(report, cancellationToken);
 
-                // Both of these metadata reads exist ONLY to feed the drill-through pass. When drill-through
-                // is disabled they are skipped entirely: they cost extra REST calls per report, and leaving
-                // DrillThroughTargets populated would still render the drill-through email section.
-                if (CheckDrillThrough)
-                {
-                    // Read the DECLARED drill-through targets from report metadata (workspace-member access),
-                    // so the headless checker can open each destination page deterministically instead of
-                    // guessing via DOM right-clicks. Never throws; empty when the report has none.
-                    var drillThroughTargets = await _embedService.GetDrillThroughMapAsync(report, cancellationToken);
-                    embed.DrillThroughTargets = drillThroughTargets.ToList();
-                    embed.DrillThroughMapDiagnostic = _embedService.LastDrillThroughMapDiagnostic;
+                // Read the declared drill-through targets from report metadata so the headless checker can
+                // open each destination page deterministically instead of guessing via DOM right-clicks.
+                var drillThroughTargets = await _embedService.GetDrillThroughMapAsync(report, cancellationToken);
+                embed.DrillThroughTargets = drillThroughTargets.ToList();
+                embed.DrillThroughMapDiagnostic = _embedService.LastDrillThroughMapDiagnostic;
 
-                    // Read every visual and the fields it projects, also from metadata. Combined with the
-                    // targets above this identifies which visuals can raise each drill-through without
-                    // needing the report to render or return any rows.
-                    var visualDefinitions = await _embedService.GetVisualFieldMapAsync(report, cancellationToken);
-                    embed.VisualDefinitions = visualDefinitions.ToList();
+                var pages = await _embedService.GetReportPagesAsync(report, cancellationToken);
+                var landingPage = pages
+                    .OrderBy(page => page.Order)
+                    .FirstOrDefault();
+                if (landingPage is not null)
+                {
+                    embed.LandingPageName = landingPage.Name;
+                    embed.LandingPageDisplayName = landingPage.DisplayName;
+
+                    var excludedLandingTargets = embed.DrillThroughTargets
+                        .Where(target =>
+                            string.Equals(target.PageName, landingPage.Name, StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(target.PageDisplayName, landingPage.DisplayName, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                    if (excludedLandingTargets.Count > 0)
+                    {
+                        embed.DrillThroughTargets = embed.DrillThroughTargets
+                            .Except(excludedLandingTargets)
+                            .ToList();
+                        var warning =
+                            $"Landing page '{landingPage.DisplayName}' (order {landingPage.Order}) is marked " +
+                            "Drillthrough in PBIR and was excluded from actionable destination coverage. " +
+                            "Remove its Drill-through filter in Power BI if it is only the landing page.";
+                        embed.DrillThroughMapDiagnostic = string.IsNullOrWhiteSpace(embed.DrillThroughMapDiagnostic)
+                            ? warning
+                            : $"{embed.DrillThroughMapDiagnostic} {warning}";
+                    }
                 }
+
+                // Read every visual and the fields it projects, also from metadata. Combined with the
+                // targets above this identifies which visuals can raise each drill-through without
+                // needing the report to render or return any rows.
+                var visualDefinitions = await _embedService.GetVisualFieldMapAsync(report, cancellationToken);
+                embed.VisualDefinitions = visualDefinitions.ToList();
 
                 configs.Add(embed);
             }
@@ -260,9 +262,11 @@ public sealed class ReportSanityCheckService : IReportSanityCheckService
 
         // When no targets were declared, record WHY so the email explains an empty map instead of
         // silently claiming the report has none.
-        if (embed.DrillThroughTargets.Count == 0 && !string.IsNullOrWhiteSpace(embed.DrillThroughMapDiagnostic))
+        if (!string.IsNullOrWhiteSpace(embed.DrillThroughMapDiagnostic))
         {
-            drillThrough.Notes.Add($"Declared drill-through map empty: {embed.DrillThroughMapDiagnostic}");
+            drillThrough.Notes.Add(embed.DrillThroughTargets.Count == 0
+                ? $"Declared drill-through map empty: {embed.DrillThroughMapDiagnostic}"
+                : embed.DrillThroughMapDiagnostic);
         }
 
         return new ReportSanityResult
@@ -279,7 +283,8 @@ public sealed class ReportSanityCheckService : IReportSanityCheckService
             Bookmarks = interopResult.Bookmarks,
             Pages = interopResult.Pages,
             Interactions = interopResult.Interactions,
-            DrillThrough = drillThrough
+            DrillThrough = drillThrough,
+            Performance = interopResult.Performance
         };
     }
 
